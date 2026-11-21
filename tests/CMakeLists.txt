@@ -29,6 +29,7 @@ if(WIN32 AND GURABO_ENABLE_HIP)
     # Run CTest from CLion without adding the SDK to the machine-wide PATH.
     get_property(gurabo_tests DIRECTORY PROPERTY TESTS)
     set_tests_properties(${gurabo_tests} PROPERTIES
-        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:roc::rocblas>"
+        ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:roc::rocblas>;PATH=path_list_prepend:$<TARGET_FILE_DIR:hiprtc::hiprtc>"
     )
 endif()

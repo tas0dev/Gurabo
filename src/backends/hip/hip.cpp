@@ -1,9 +1,12 @@
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <hip/hip_runtime_api.h>
+#include <hip/hiprtc.h>
 #include <rocblas/rocblas.h>
 #include "backend.h"
+#include "gurabo_hip_kernels.h"
 
 namespace {
 
@@ -71,6 +74,116 @@ private:
     int previous = 0;
     bool changed = false;
 };
+
+struct pointwise_module {
+    hipModule_t module = nullptr;
+    hipFunction_t function = nullptr;
+};
+
+gb_result hiprtc_result(hiprtcResult error, hiprtcProgram program)
+{
+    const char *message = hiprtcGetErrorString(error);
+    if (error == HIPRTC_ERROR_COMPILATION) {
+        size_t bytes = 0;
+        if (hiprtcGetProgramLogSize(program, &bytes) == HIPRTC_SUCCESS && bytes > 1) {
+            std::unique_ptr<char[]> log(new (std::nothrow) char[bytes]);
+            if (log && hiprtcGetProgramLog(program, log.get()) == HIPRTC_SUCCESS) {
+                static thread_local char detail[192];
+                std::snprintf(detail, sizeof(detail), "%s: %.140s", message, log.get());
+                message = detail;
+            }
+        }
+    }
+    gurabo_status status = error == HIPRTC_ERROR_OUT_OF_MEMORY
+                           ? GURABO_OUT_OF_MEMORY : GURABO_BACKEND_ERROR;
+    return {status, GURABO_NATIVE_HIPRTC, error, message};
+}
+
+gb_result compile_pointwise(const char *architecture, std::unique_ptr<char[]> &code)
+{
+    const char *headers[] = {gurabo_pointwise_header, gurabo_float16_header};
+    const char *names[] = {"pointwise.h", "float16_bits.h"};
+    hiprtcProgram program = nullptr;
+    hiprtcResult error = hiprtcCreateProgram(&program, gurabo_hip_source, "gurabo_kernels.hip",
+                                             2, headers, names);
+    if (error != HIPRTC_SUCCESS) {
+        return hiprtc_result(error, program);
+    }
+    char target[288];
+    std::snprintf(target, sizeof(target), "--gpu-architecture=%s", architecture);
+    const char *options[] = {target, "-O3"};
+    error = hiprtcCompileProgram(program, 2, options);
+    if (error == HIPRTC_SUCCESS) {
+        size_t bytes = 0;
+        error = hiprtcGetCodeSize(program, &bytes);
+        if (error == HIPRTC_SUCCESS) {
+            code.reset(new (std::nothrow) char[bytes]);
+            error = code ? hiprtcGetCode(program, code.get()) : HIPRTC_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    gb_result result = error == HIPRTC_SUCCESS ? gb_status(GURABO_OK)
+                                               : hiprtc_result(error, program);
+    hiprtcDestroyProgram(&program);
+    return result;
+}
+
+gb_result pointwise_prepare(uint32_t ordinal, void **state)
+{
+    device_scope device(ordinal);
+    if (device.error != hipSuccess) {
+        return hip_result(device.error);
+    }
+    hipDeviceProp_t properties{};
+    hipError_t error = hipGetDeviceProperties(&properties, static_cast<int>(ordinal));
+    if (error != hipSuccess) {
+        return hip_result(error);
+    }
+    auto module = std::unique_ptr<pointwise_module>(new (std::nothrow) pointwise_module);
+    if (!module) {
+        return gb_status(GURABO_OUT_OF_MEMORY);
+    }
+    std::unique_ptr<char[]> code;
+    gb_result result = compile_pointwise(properties.gcnArchName, code);
+    if (result.status != GURABO_OK) {
+        return result;
+    }
+    error = hipModuleLoadData(&module->module, code.get());
+    if (error == hipSuccess) {
+        error = hipModuleGetFunction(&module->function, module->module, "gurabo_pointwise");
+        if (error != hipSuccess) {
+            (void)hipModuleUnload(module->module);
+        }
+    }
+    if (error == hipSuccess) {
+        *state = module.release();
+    }
+    return hip_result(error);
+}
+
+gb_result pointwise_release(uint32_t ordinal, void *state)
+{
+    auto module = std::unique_ptr<pointwise_module>(static_cast<pointwise_module *>(state));
+    device_scope device(ordinal);
+    return hip_result(device.error == hipSuccess ? hipModuleUnload(module->module) : device.error);
+}
+
+gb_result pointwise(void *stream, void *state, const gb_pointwise *args)
+{
+    auto *native = static_cast<hip_stream *>(stream);
+    auto *module = static_cast<pointwise_module *>(state);
+    device_scope device(native->ordinal);
+    if (device.error != hipSuccess) {
+        return hip_result(device.error);
+    }
+    constexpr unsigned threads = 256;
+    constexpr unsigned max_blocks = 65535;
+    uint64_t blocks = (args->count + threads - 1) / threads;
+    unsigned grid = blocks < max_blocks ? static_cast<unsigned>(blocks) : max_blocks;
+    gb_pointwise parameters = *args;
+    void *kernel_args[] = {&parameters};
+    return hip_result(hipModuleLaunchKernel(module->function, grid, 1, 1, threads, 1, 1,
+                                           0, native->stream, kernel_args, nullptr));
+}
 
 gb_result count_devices(uint32_t *out)
 {
@@ -349,7 +462,8 @@ const gb_backend gb_hip = {
     GURABO_HIP,
     256,
     GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_PINNED_HOST_MEMORY |
-        GURABO_FEATURE_F16_GEMM | GURABO_FEATURE_BF16_GEMM,
+        GURABO_FEATURE_F16_GEMM | GURABO_FEATURE_BF16_GEMM |
+        GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL,
     count_devices,
     device_info,
     alloc,
@@ -365,5 +479,8 @@ const gb_backend gb_hip = {
     marker_wait,
     transfer,
     copy,
-    matmul
+    matmul,
+    pointwise_prepare,
+    pointwise_release,
+    pointwise
 };

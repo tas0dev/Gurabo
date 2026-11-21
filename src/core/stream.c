@@ -72,6 +72,9 @@ static void retire_job(gurabo_stream *stream, int safe, int defer_buffer_free)
         stream->tail = NULL;
     }
     gurabo_context *context = stream->context;
+    if (!safe && job->uses_pointwise_module) {
+        context->pointwise_in_doubt = 1;
+    }
     if (job->dependency) {
         gurabo_event *dependency = job->dependency;
         if (safe) {

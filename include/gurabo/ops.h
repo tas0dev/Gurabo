@@ -29,6 +29,21 @@ gurabo_status gurabo_gemm_async(gurabo_stream *stream, gurabo_tensor *out,
                                 const gurabo_tensor *a, const gurabo_tensor *b,
                                 const gurabo_matmul_desc *desc);
 
+/* Convert between F32 and F16/BF16 on the Stream. Both Tensors must have
+   the same shape, contiguous storage and disjoint byte ranges. */
+gurabo_status gurabo_tensor_cast_async(gurabo_stream *stream, gurabo_tensor *out,
+                                       const gurabo_tensor *input);
+
+typedef uint32_t gurabo_binary_op;
+enum { GURABO_ADD = 1, GURABO_MUL = 2 };
+
+/* Contiguous F32, F16 or BF16 Tensors with matching dtypes. Inputs broadcast
+   from the trailing axes. Arithmetic is F32, then rounded to the output
+   dtype. An output may alias an input with the exact same element mapping. */
+gurabo_status gurabo_binary_async(gurabo_stream *stream, gurabo_binary_op op,
+                                  gurabo_tensor *out, const gurabo_tensor *a,
+                                  const gurabo_tensor *b);
+
 #ifdef __cplusplus
 }
 #endif

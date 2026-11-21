@@ -40,7 +40,8 @@ typedef uint32_t gurabo_native_domain;
 enum {
     GURABO_NATIVE_GURABO = 0,
     GURABO_NATIVE_HIP = 1,
-    GURABO_NATIVE_ROCBLAS = 2
+    GURABO_NATIVE_ROCBLAS = 2,
+    GURABO_NATIVE_HIPRTC = 3
 };
 
 typedef struct {

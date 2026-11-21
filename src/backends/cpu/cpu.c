@@ -127,10 +127,21 @@ static gb_result cpu_matmul(void *stream, const gb_matmul *args)
     return gb_status(GURABO_OK);
 }
 
+static gb_result cpu_pointwise(void *stream, void *state, const gb_pointwise *args)
+{
+    (void)stream;
+    (void)state;
+    for (uint64_t i = 0; i < args->count; ++i) {
+        gb_pointwise_apply(args, i);
+    }
+    return gb_status(GURABO_OK);
+}
+
 const gb_backend gb_cpu = {
     .id = GURABO_CPU,
     .alignment = 64,
-    .features = GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_F16_GEMM | GURABO_FEATURE_BF16_GEMM,
+    .features = GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_F16_GEMM | GURABO_FEATURE_BF16_GEMM |
+                GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL,
     .device_count = cpu_count,
     .device_info = cpu_info,
     .alloc = cpu_alloc,
@@ -140,5 +151,6 @@ const gb_backend gb_cpu = {
     .stream_sync = cpu_stream_noop,
     .transfer = cpu_transfer,
     .copy = cpu_copy,
-    .matmul = cpu_matmul
+    .matmul = cpu_matmul,
+    .pointwise = cpu_pointwise
 };

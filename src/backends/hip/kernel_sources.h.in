@@ -1,0 +1,3 @@
+static constexpr char gurabo_hip_source[] = R"gurabo(@GURABO_HIP_SOURCE@)gurabo";
+static constexpr char gurabo_pointwise_header[] = R"gurabo(@GURABO_POINTWISE_HEADER@)gurabo";
+static constexpr char gurabo_float16_header[] = R"gurabo(@GURABO_FLOAT16_HEADER@)gurabo";

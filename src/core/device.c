@@ -153,6 +153,14 @@ gurabo_status gurabo_context_destroy(gurabo_context **context)
         return gb_fail(GURABO_BUSY, value->backend->id);
     }
     gb_buffer_collect(value);
+    if (value->pointwise_state && !value->pointwise_in_doubt) {
+        gb_result result = value->backend->pointwise_release(value->ordinal, value->pointwise_state);
+        if (result.status != GURABO_OK) {
+            gurabo_error_info error = gb_make_error(result, value->backend->id,
+                                                    GURABO_ERROR_CLEANUP, 0);
+            gb_context_error(value, &error);
+        }
+    }
     gurabo_error_info error = value->error;
     gb_unlock(&value->gate);
     gb_mutex_destroy(&value->gate);

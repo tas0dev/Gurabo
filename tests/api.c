@@ -71,6 +71,8 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     CHECK(caps.feature_mask & GURABO_FEATURE_F32_MATMUL);
     CHECK(caps.feature_mask & GURABO_FEATURE_F16_GEMM);
     CHECK(caps.feature_mask & GURABO_FEATURE_BF16_GEMM);
+    CHECK(caps.feature_mask & GURABO_FEATURE_TENSOR_CAST);
+    CHECK(caps.feature_mask & GURABO_FEATURE_BINARY_ADD_MUL);
     CHECK(!!(caps.feature_mask & GURABO_FEATURE_PINNED_HOST_MEMORY) == (backend == GURABO_HIP));
     CHECK(caps.max_tensor_rank == GURABO_MAX_RANK && caps.min_buffer_alignment >= sizeof(float));
 
@@ -311,6 +313,157 @@ static void check_pinned_memory(gurabo_context *context)
     CHECK(usage == 0);
 }
 
+static void check_pointwise_chain(gurabo_context *context, gurabo_stream *stream,
+                                  gurabo_dtype dtype)
+{
+    const float input[] = {1, 2, 3, 4};
+    const float row[] = {1, 2};
+    const float expected[] = {448, 1344, 896, 2688};
+    const float expected_expanded[] = {8, 24, 16, 48};
+    float actual[4];
+    gurabo_buffer *buffer = NULL;
+    gurabo_tensor *input_f32 = NULL, *row_f32 = NULL, *first = NULL, *last = NULL;
+    gurabo_tensor *input_16 = NULL, *row_16 = NULL, *intermediate = NULL, *expanded = NULL;
+    gurabo_tensor_desc matrix = matrix_desc(2, 2);
+    gurabo_tensor_desc row_shape = matrix_desc(1, 2);
+    row_shape.rank = 1;
+    row_shape.extent[0] = 2;
+    OK(gurabo_buffer_alloc(context, 128, 0, &buffer));
+    OK(gurabo_tensor_create(buffer, 0, &matrix, &input_f32));
+    OK(gurabo_tensor_create(buffer, 16, &matrix, &first));
+    OK(gurabo_tensor_create(buffer, 32, &matrix, &last));
+    OK(gurabo_tensor_create(buffer, 48, &matrix, &expanded));
+    OK(gurabo_tensor_create(buffer, 64, &row_shape, &row_f32));
+    matrix.dtype = row_shape.dtype = dtype;
+    OK(gurabo_tensor_create(buffer, 80, &matrix, &input_16));
+    OK(gurabo_tensor_create(buffer, 96, &matrix, &intermediate));
+    OK(gurabo_tensor_create(buffer, 112, &row_shape, &row_16));
+    OK(gurabo_buffer_write(stream, buffer, 0, input, sizeof(input)));
+    OK(gurabo_buffer_write(stream, buffer, 64, row, sizeof(row)));
+
+    STATUS(gurabo_tensor_cast_async(stream, row_16, input_f32), GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_binary_async(stream, GURABO_ADD, intermediate, input_16, row_f32),
+           GURABO_UNSUPPORTED);
+    OK(gurabo_tensor_cast_async(stream, input_16, input_f32));
+    OK(gurabo_tensor_cast_async(stream, row_16, row_f32));
+    OK(gurabo_gemm_async(stream, first, input_16, input_16, NULL));
+    OK(gurabo_tensor_cast_async(stream, intermediate, first));
+    OK(gurabo_binary_async(stream, GURABO_ADD, intermediate, intermediate, row_16));
+    OK(gurabo_binary_async(stream, GURABO_MUL, intermediate, row_16, intermediate));
+    OK(gurabo_tensor_cast_async(stream, expanded, intermediate));
+    OK(gurabo_gemm_async(stream, last, intermediate, intermediate, NULL));
+
+    OK(gurabo_tensor_release(&input_f32));
+    OK(gurabo_tensor_release(&row_f32));
+    OK(gurabo_tensor_release(&first));
+    OK(gurabo_tensor_release(&last));
+    OK(gurabo_tensor_release(&input_16));
+    OK(gurabo_tensor_release(&row_16));
+    OK(gurabo_tensor_release(&intermediate));
+    OK(gurabo_tensor_release(&expanded));
+    OK(gurabo_buffer_read(stream, actual, buffer, 32, sizeof(actual)));
+    CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+    OK(gurabo_buffer_read(stream, actual, buffer, 48, sizeof(actual)));
+    CHECK(memcmp(actual, expected_expanded, sizeof(actual)) == 0);
+    OK(gurabo_buffer_release(&buffer));
+}
+
+static void check_binary_broadcast(gurabo_context *context, gurabo_stream *stream)
+{
+    const float a[] = {2, 4}, b[] = {3, 5, 7}, bias = 10;
+    const float expected[] = {16, 20, 24, 22, 30, 38};
+    float actual[6];
+    gurabo_buffer *buffer = NULL;
+    gurabo_tensor *lhs = NULL, *rhs = NULL, *scalar = NULL, *out = NULL;
+    gurabo_tensor *broadcast_alias = NULL, *partial_alias = NULL, *strided = NULL;
+    gurabo_tensor_desc a_shape = matrix_desc(2, 1), b_shape = matrix_desc(3, 1);
+    gurabo_tensor_desc scalar_shape = matrix_desc(1, 1), out_shape = matrix_desc(2, 3);
+    b_shape.rank = 1;
+    scalar_shape.rank = 0;
+    OK(gurabo_buffer_alloc(context, 160, 0, &buffer));
+    OK(gurabo_tensor_create(buffer, 0, &a_shape, &lhs));
+    OK(gurabo_tensor_create(buffer, 32, &b_shape, &rhs));
+    OK(gurabo_tensor_create(buffer, 48, &scalar_shape, &scalar));
+    OK(gurabo_tensor_create(buffer, 64, &out_shape, &out));
+    OK(gurabo_tensor_create(buffer, 0, &out_shape, &broadcast_alias));
+    OK(gurabo_tensor_create(buffer, 68, &out_shape, &partial_alias));
+    out_shape.flags = GURABO_TENSOR_EXPLICIT_STRIDES;
+    out_shape.stride[0] = 4;
+    out_shape.stride[1] = 1;
+    OK(gurabo_tensor_create(buffer, 96, &out_shape, &strided));
+    OK(gurabo_buffer_write(stream, buffer, 0, a, sizeof(a)));
+    OK(gurabo_buffer_write(stream, buffer, 32, b, sizeof(b)));
+    OK(gurabo_buffer_write(stream, buffer, 48, &bias, sizeof(bias)));
+
+    STATUS(gurabo_binary_async(stream, 0, out, lhs, rhs), GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_binary_async(stream, GURABO_ADD, lhs, lhs, rhs), GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_binary_async(stream, GURABO_ADD, broadcast_alias, lhs, rhs),
+           GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_binary_async(stream, GURABO_ADD, partial_alias, out, scalar),
+           GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_binary_async(stream, GURABO_ADD, strided, lhs, rhs), GURABO_UNSUPPORTED);
+
+    OK(gurabo_binary_async(stream, GURABO_MUL, out, lhs, rhs));
+    OK(gurabo_binary_async(stream, GURABO_ADD, out, out, scalar));
+    OK(gurabo_buffer_read(stream, actual, buffer, 64, sizeof(actual)));
+    CHECK(memcmp(actual, expected, sizeof(expected)) == 0);
+    OK(gurabo_tensor_release(&strided));
+    OK(gurabo_tensor_release(&partial_alias));
+    OK(gurabo_tensor_release(&broadcast_alias));
+    OK(gurabo_tensor_release(&out));
+    OK(gurabo_tensor_release(&scalar));
+    OK(gurabo_tensor_release(&rhs));
+    OK(gurabo_tensor_release(&lhs));
+    OK(gurabo_buffer_release(&buffer));
+}
+
+static void check_cast_bits(gurabo_context *context, gurabo_stream *stream, gurabo_dtype dtype)
+{
+    const size_t count = (size_t)UINT16_MAX + 1;
+    const size_t narrow_bytes = count * sizeof(uint16_t);
+    const size_t wide_bytes = count * sizeof(float);
+    uint16_t *patterns = malloc(narrow_bytes);
+    uint32_t *expanded = malloc(wide_bytes);
+    CHECK(patterns && expanded);
+    gurabo_buffer *buffer = NULL;
+    gurabo_tensor *input = NULL, *output = NULL, *wide = NULL;
+    gurabo_tensor_desc shape = matrix_desc(count, 1);
+    shape.rank = 1;
+    shape.dtype = dtype;
+    OK(gurabo_buffer_alloc(context, 2 * narrow_bytes + wide_bytes, 0, &buffer));
+    OK(gurabo_tensor_create(buffer, 0, &shape, &input));
+    OK(gurabo_tensor_create(buffer, narrow_bytes, &shape, &output));
+    shape.dtype = GURABO_F32;
+    OK(gurabo_tensor_create(buffer, 2 * narrow_bytes, &shape, &wide));
+    for (size_t i = 0; i < count; ++i) {
+        patterns[i] = (uint16_t)i;
+    }
+    OK(gurabo_buffer_write(stream, buffer, 0, patterns, narrow_bytes));
+    OK(gurabo_tensor_cast_async(stream, wide, input));
+    OK(gurabo_tensor_cast_async(stream, output, wide));
+    OK(gurabo_buffer_read(stream, expanded, buffer, 2 * narrow_bytes, wide_bytes));
+    OK(gurabo_buffer_read(stream, patterns, buffer, narrow_bytes, narrow_bytes));
+
+    float (*decode)(uint16_t) = dtype == GURABO_F16 ? gurabo_f16_to_f32 : gurabo_bf16_to_f32;
+    uint16_t (*encode)(float) = dtype == GURABO_F16 ? gurabo_f16_from_f32 : gurabo_bf16_from_f32;
+    uint16_t infinity = dtype == GURABO_F16 ? 0x7C00u : 0x7F80u;
+    for (size_t i = 0; i < count; ++i) {
+        float reference = decode((uint16_t)i);
+        uint32_t bits;
+        memcpy(&bits, &reference, sizeof(bits));
+        if ((i & 0x7FFFu) <= infinity) {
+            CHECK(expanded[i] == bits);
+        }
+        CHECK(patterns[i] == encode(reference));
+    }
+    OK(gurabo_tensor_release(&input));
+    OK(gurabo_tensor_release(&wide));
+    OK(gurabo_tensor_release(&output));
+    OK(gurabo_buffer_release(&buffer));
+    free(expanded);
+    free(patterns);
+}
+
 static void check_float16_conversion(void)
 {
     CHECK(gurabo_f16_from_f32(-0.0f) == 0x8000u);
@@ -470,6 +623,11 @@ int main(int argc, char **argv)
     check_layout(context);
     check_events(backend, ordinal, context);
     check_pinned_memory(context);
+    check_binary_broadcast(context, stream);
+    check_cast_bits(context, stream, GURABO_F16);
+    check_cast_bits(context, stream, GURABO_BF16);
+    check_pointwise_chain(context, stream, GURABO_F16);
+    check_pointwise_chain(context, stream, GURABO_BF16);
     check_float16_conversion();
     for (gurabo_dtype dtype = GURABO_F32; dtype <= GURABO_BF16; ++dtype) {
         double max_input_rounding = 0;

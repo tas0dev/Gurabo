@@ -44,13 +44,15 @@ if(GURABO_ENABLE_HIP)
 
     find_package(hip CONFIG QUIET)
     find_package(rocblas CONFIG QUIET)
-    if(NOT hip_FOUND OR NOT rocblas_FOUND OR NOT TARGET hip::host OR NOT TARGET roc::rocblas)
+    find_package(hiprtc CONFIG QUIET)
+    if(NOT TARGET hip::host OR NOT TARGET roc::rocblas OR NOT TARGET hiprtc::hiprtc)
         message(FATAL_ERROR
-            "Gurabo could not find HIP and rocBLAS development packages. "
-            "Install the HIP SDK and HIP Libraries (Runtime and Development). "
+            "Gurabo requires the HIP, rocBLAS and HIPRTC development packages. "
+            "Install the HIP SDK, HIP Libraries and HIP Runtime Compiler. "
             "For a custom installation, set -DGURABO_HIP_SDK_ROOT=<SDK path> "
             "in the CLion profile's CMake options.\n"
-            "Detected package directories: hip='${hip_DIR}', rocblas='${rocblas_DIR}'.")
+            "Detected package directories: hip='${hip_DIR}', rocblas='${rocblas_DIR}', "
+            "hiprtc='${hiprtc_DIR}'.")
     endif()
     message(STATUS "Gurabo HIP: HIP ${hip_VERSION}, rocBLAS ${rocblas_VERSION}")
 endif()
@@ -59,6 +61,7 @@ endif()
 add_library(Gurabo STATIC
     src/gurabo.c
     src/core/device.c
+    src/core/elementwise.c
     src/core/error.c
     src/core/float16.c
     src/core/memory.c
@@ -66,6 +69,8 @@ add_library(Gurabo STATIC
     src/core/tensor.c
     src/core/backend.h
     src/core/core.h
+    src/core/float16_bits.h
+    src/core/pointwise.h
 )
 add_library(Gurabo::Gurabo ALIAS Gurabo)
 target_compile_features(Gurabo PUBLIC c_std_11)
@@ -97,10 +102,20 @@ if(GURABO_ENABLE_CPU)
 endif()
 
 if(GURABO_ENABLE_HIP)
-    target_sources(Gurabo PRIVATE src/backends/hip/hip.cpp)
+    # Embed the sources for HIPRTC so running a program needs no source files.
+    set(hip_kernel_source src/backends/hip/kernels.hip)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${hip_kernel_source}" src/core/pointwise.h src/core/float16_bits.h)
+    file(READ "${hip_kernel_source}" GURABO_HIP_SOURCE)
+    file(READ src/core/pointwise.h GURABO_POINTWISE_HEADER)
+    file(READ src/core/float16_bits.h GURABO_FLOAT16_HEADER)
+    configure_file(src/backends/hip/kernel_sources.h.in gurabo_hip_kernels.h @ONLY)
+    set_source_files_properties("${hip_kernel_source}" PROPERTIES HEADER_FILE_ONLY ON)
+    target_include_directories(Gurabo PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_sources(Gurabo PRIVATE src/backends/hip/hip.cpp "${hip_kernel_source}")
     target_compile_features(Gurabo PRIVATE cxx_std_17)
     target_compile_definitions(Gurabo PRIVATE GURABO_WITH_HIP=1)
-    target_link_libraries(Gurabo PRIVATE hip::host roc::rocblas)
+    target_link_libraries(Gurabo PRIVATE hip::host roc::rocblas hiprtc::hiprtc)
 endif()
 
 # Optional CTest and benchmark targets.

@@ -2,6 +2,7 @@
 #define GURABO_BACKEND_H
 #include <stddef.h>
 #include <gurabo/gurabo.h>
+#include "pointwise.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,6 +69,9 @@ typedef struct {
     gb_result (*copy)(void *stream, void *dst, const void *src, size_t bytes,
                       gb_copy_direction);
     gb_result (*matmul)(void *stream, const gb_matmul *);
+    gb_result (*pointwise_prepare)(uint32_t ordinal, void **state);
+    gb_result (*pointwise_release)(uint32_t ordinal, void *state);
+    gb_result (*pointwise)(void *stream, void *state, const gb_pointwise *);
 } gb_backend;
 
 static inline gb_result gb_status(gurabo_status status)

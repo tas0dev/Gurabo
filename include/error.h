@@ -1,4 +1,4 @@
-#ifndef GURABO_ERROR_H
-#define GURABO_ERROR_H
-
-#endif //GURABO_ERROR_H
+#ifndef GURABO_LEGACY_ERROR_H
+#define GURABO_LEGACY_ERROR_H
+#include <gurabo/error.h>
+#endif

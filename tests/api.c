@@ -84,6 +84,7 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     CHECK(caps.feature_mask & GURABO_FEATURE_BATCHED_GEMM);
     CHECK(caps.feature_mask & GURABO_FEATURE_AXPBY);
     CHECK(caps.feature_mask & GURABO_FEATURE_TENSOR_COPY);
+    CHECK(caps.feature_mask & GURABO_FEATURE_TENSOR_INIT);
     CHECK(!!(caps.feature_mask & GURABO_FEATURE_PINNED_HOST_MEMORY) == (backend == GURABO_HIP));
     CHECK(caps.max_tensor_rank == GURABO_MAX_RANK && caps.min_buffer_alignment >= sizeof(float));
 
@@ -814,6 +815,7 @@ static void check_tensor_copy_gemm(gurabo_context *context, gurabo_stream *strea
     } original = {{1, 4, 2, 5, 3, 6}, {0, 7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12}};
     gurabo_buffer *source = NULL, *packed = NULL;
     gurabo_tensor *transposed = NULL, *sliced = NULL, *left = NULL, *right = NULL, *result = NULL;
+    gurabo_tensor *raw_left = NULL, *raw_right = NULL, *flat = NULL;
     const size_t right_offset = sizeof(original.transposed);
     const size_t output_offset = 2 * right_offset;
     float actual[4];
@@ -826,14 +828,26 @@ static void check_tensor_copy_gemm(gurabo_context *context, gurabo_stream *strea
     OK(gurabo_tensor_create(packed, 0, &left_shape, &left));
     OK(gurabo_tensor_create(packed, right_offset, &right_shape, &right));
     OK(gurabo_tensor_create(packed, output_offset, &result_shape, &result));
-    left_shape.flags = right_shape.flags = GURABO_TENSOR_EXPLICIT_STRIDES;
-    left_shape.stride[0] = 1;
-    left_shape.stride[1] = 2;
-    right_shape.stride[0] = 4;
-    right_shape.stride[1] = 2;
-    OK(gurabo_tensor_create(source, 0, &left_shape, &transposed));
-    size_t slice_offset = offsetof(struct source_storage, padded) + sizeof(float);
-    OK(gurabo_tensor_create(source, slice_offset, &right_shape, &sliced));
+    gurabo_tensor_desc left_storage = matrix_desc(3, 2), right_storage = matrix_desc(3, 4);
+    OK(gurabo_tensor_create(source, 0, &left_storage, &raw_left));
+    OK(gurabo_tensor_create(source, offsetof(struct source_storage, padded), &right_storage, &raw_right));
+    OK(gurabo_tensor_transpose(raw_left, 0, 1, &transposed));
+    OK(gurabo_tensor_slice(raw_right, 1, 1, 2, 2, &sliced));
+    STATUS(gurabo_tensor_slice(raw_right, 1, 1, 3, 2, &flat), GURABO_OUT_OF_RANGE);
+    uint64_t extent = 6;
+    STATUS(gurabo_tensor_reshape(transposed, 1, &extent, &flat), GURABO_UNSUPPORTED);
+    OK(gurabo_tensor_reshape(left, 1, &extent, &flat));
+    OK(gurabo_tensor_release(&flat));
+    OK(gurabo_tensor_slice(raw_right, 1, 4, 0, 1, &flat));
+    extent = 0;
+    gurabo_tensor *empty = NULL;
+    OK(gurabo_tensor_transpose(flat, 0, 1, &empty));
+    OK(gurabo_tensor_release(&flat));
+    OK(gurabo_tensor_reshape(empty, 1, &extent, &flat));
+    OK(gurabo_tensor_release(&flat));
+    OK(gurabo_tensor_release(&empty));
+    OK(gurabo_tensor_release(&raw_left));
+    OK(gurabo_tensor_release(&raw_right));
     STATUS(gurabo_tensor_copy_async(stream, left, sliced), GURABO_INVALID_ARGUMENT);
     OK(gurabo_tensor_copy_async(stream, left, transposed));
     OK(gurabo_tensor_copy_async(stream, right, sliced));
@@ -847,6 +861,44 @@ static void check_tensor_copy_gemm(gurabo_context *context, gurabo_stream *strea
     OK(gurabo_buffer_read(stream, actual, packed, output_offset, sizeof(actual)));
     CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
     OK(gurabo_buffer_release(&packed));
+}
+
+static void check_initializers(gurabo_context *context, gurabo_stream *stream)
+{
+    gurabo_buffer *buffer = NULL;
+    gurabo_tensor *out = NULL, *tail = NULL, *integer = NULL;
+    OK(gurabo_buffer_alloc(context, 32, 0, &buffer));
+    gurabo_tensor_desc desc = matrix_desc(1, 4);
+    OK(gurabo_tensor_create(buffer, 0, &desc, &out));
+    OK(gurabo_tensor_slice(out, 1, 2, 2, 1, &tail));
+    desc.dtype = GURABO_I64;
+    desc.extent[1] = 2;
+    OK(gurabo_tensor_create(buffer, 16, &desc, &integer));
+    int64_t fill = INT64_C(-9223372036854775807);
+    OK(gurabo_tensor_fill_async(stream, integer, &fill));
+    fill = 0;
+    int64_t actual_int[2];
+    OK(gurabo_buffer_read(stream, actual_int, buffer, 16, sizeof(actual_int)));
+    CHECK(actual_int[0] == INT64_C(-9223372036854775807) && actual_int[1] == actual_int[0]);
+    STATUS(gurabo_tensor_random_uniform_async(stream, integer, 0, 0), GURABO_UNSUPPORTED);
+    STATUS(gurabo_tensor_random_uniform_async(stream, out, 0, UINT64_MAX - 2), GURABO_OUT_OF_RANGE);
+    OK(gurabo_tensor_random_uniform_async(stream, out, 0, 0));
+    float actual[4];
+    const uint32_t expected[] = {14819496, 7239838, 443485, 16288696};
+    OK(gurabo_buffer_read(stream, actual, buffer, 0, sizeof(actual)));
+    for (size_t i = 0; i < 4; ++i) {
+        CHECK(actual[i] == (float)expected[i] / 16777216.0f);
+    }
+    OK(gurabo_tensor_zero_async(stream, out));
+    OK(gurabo_tensor_random_uniform_async(stream, tail, 0, 2));
+    OK(gurabo_buffer_read(stream, actual, buffer, 0, sizeof(actual)));
+    CHECK(actual[0] == 0 && actual[1] == 0);
+    CHECK(actual[2] == (float)expected[2] / 16777216.0f);
+    CHECK(actual[3] == (float)expected[3] / 16777216.0f);
+    OK(gurabo_tensor_release(&integer));
+    OK(gurabo_tensor_release(&tail));
+    OK(gurabo_tensor_release(&out));
+    OK(gurabo_buffer_release(&buffer));
 }
 
 static void check_axpby(gurabo_context *context, gurabo_stream *stream)
@@ -1074,6 +1126,7 @@ int main(int argc, char **argv)
     check_softmax_activation(context, stream);
     check_tensor_copy_gemm(context, stream);
     check_tensor_copy_bits(context, stream);
+    check_initializers(context, stream);
     check_axpby(context, stream);
     check_float16_conversion();
     for (gurabo_dtype dtype = GURABO_F32; dtype <= GURABO_BF16; ++dtype) {

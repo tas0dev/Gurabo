@@ -23,7 +23,7 @@ static gurabo_status tensor_layout(gurabo_tensor *tensor, const gurabo_tensor_de
         uint64_t stride = (shape->flags & GURABO_TENSOR_EXPLICIT_STRIDES)
                         ? desc->stride[axis] : expected;
         shape->stride[axis] = stride;
-        if (extent > 1 && stride == 0 && (shape->flags & GURABO_TENSOR_EXPLICIT_STRIDES)) {
+        if (!empty && extent > 1 && stride == 0) {
             return GURABO_INVALID_ARGUMENT;
         }
         if (empty) {
@@ -146,6 +146,85 @@ gurabo_status gurabo_tensor_is_contiguous(const gurabo_tensor *tensor, uint32_t 
     }
     *out = tensor->contiguous;
     return GURABO_OK;
+}
+
+gurabo_status gurabo_tensor_transpose(const gurabo_tensor *input, uint32_t axis_a,
+                                       uint32_t axis_b, gurabo_tensor **out)
+{
+    if (!input) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_backend id = input->buffer->context->backend->id;
+    gurabo_tensor_desc desc = input->desc;
+    if (axis_a >= desc.rank || axis_b >= desc.rank) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    desc.flags = GURABO_TENSOR_EXPLICIT_STRIDES;
+    desc.extent[axis_a] = input->desc.extent[axis_b];
+    desc.extent[axis_b] = input->desc.extent[axis_a];
+    desc.stride[axis_a] = input->desc.stride[axis_b];
+    desc.stride[axis_b] = input->desc.stride[axis_a];
+    return gurabo_tensor_create(input->buffer, input->offset, &desc, out);
+}
+
+gurabo_status gurabo_tensor_slice(const gurabo_tensor *input, uint32_t axis, uint64_t start,
+                                   uint64_t length, uint64_t step, gurabo_tensor **out)
+{
+    if (!input) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_backend id = input->buffer->context->backend->id;
+    gurabo_tensor_desc desc = input->desc;
+    if (axis >= desc.rank || !step) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    uint64_t extent = desc.extent[axis];
+    if (start > extent ||
+        (length && (start == extent || length - 1 > (extent - 1 - start) / step))) {
+        return gb_fail(GURABO_OUT_OF_RANGE, id);
+    }
+    uint64_t offset = input->offset;
+    uint64_t stride = desc.stride[axis];
+    if (input->span && length) {
+        /* The selected first element already lies in the validated input span. */
+        offset += start * stride * gb_dtype_size(desc.dtype);
+        if (length > 1) {
+            desc.stride[axis] = stride * step;
+        }
+    }
+    desc.flags = GURABO_TENSOR_EXPLICIT_STRIDES;
+    desc.extent[axis] = length;
+    return gurabo_tensor_create(input->buffer, offset, &desc, out);
+}
+
+gurabo_status gurabo_tensor_reshape(const gurabo_tensor *input, uint32_t rank,
+                                     const uint64_t *extent, gurabo_tensor **out)
+{
+    if (!input) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_backend id = input->buffer->context->backend->id;
+    if (rank > GURABO_MAX_RANK || (rank && !extent)) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    if (!input->contiguous) {
+        return gb_fail(GURABO_UNSUPPORTED, id);
+    }
+    gurabo_tensor_desc desc = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = input->desc.dtype,
+                               .rank = rank};
+    for (uint32_t axis = 0; axis < rank; ++axis) {
+        desc.extent[axis] = extent[axis];
+    }
+    size_t bytes = gb_dtype_size(desc.dtype);
+    gurabo_tensor layout = {0};
+    gurabo_status status = tensor_layout(&layout, &desc, bytes);
+    if (status != GURABO_OK) {
+        return gb_fail(status, id);
+    }
+    if (layout.span != input->span) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    return gurabo_tensor_create(input->buffer, input->offset, &desc, out);
 }
 
 static int tensors_overlap(const gurabo_tensor *a, const gurabo_tensor *b)

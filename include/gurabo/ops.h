@@ -46,6 +46,18 @@ gurabo_status gurabo_tensor_cast_async(gurabo_stream *stream, gurabo_tensor *out
 gurabo_status gurabo_tensor_copy_async(gurabo_stream *stream, gurabo_tensor *out,
                                        const gurabo_tensor *input);
 
+/* Initialize a contiguous Tensor. Fill copies one element in the Tensor's
+   storage representation from value before returning. Zero writes zero bits. */
+gurabo_status gurabo_tensor_fill_async(gurabo_stream *stream, gurabo_tensor *out,
+                                       const void *value);
+gurabo_status gurabo_tensor_zero_async(gurabo_stream *stream, gurabo_tensor *out);
+
+/* Uniform values in [0, 1) in a contiguous F32 Tensor. The same seed and
+   counter interval produce the same bits on all backends. Counter selects
+   the first element in the sequence. The interval must not wrap. */
+gurabo_status gurabo_tensor_random_uniform_async(gurabo_stream *stream, gurabo_tensor *out,
+                                                 uint64_t seed, uint64_t counter);
+
 typedef uint32_t gurabo_binary_op;
 enum { GURABO_ADD = 1, GURABO_MUL = 2, GURABO_SUB = 3, GURABO_DIV = 4 };
 

@@ -43,6 +43,19 @@ gurabo_status gurabo_tensor_release(gurabo_tensor **tensor);
 gurabo_status gurabo_tensor_get_desc(const gurabo_tensor *tensor, gurabo_tensor_desc *out);
 gurabo_status gurabo_tensor_is_contiguous(const gurabo_tensor *tensor, uint32_t *out);
 
+/* Views retain the input Buffer. The output slot starts at NULL. Axes are
+   zero-based. Transpose swaps two axes, including their strides. */
+gurabo_status gurabo_tensor_transpose(const gurabo_tensor *input, uint32_t axis_a,
+                                       uint32_t axis_b, gurabo_tensor **out);
+/* Select length elements at start + i * step. Step is positive.
+   An empty slice may begin at the end of its axis. */
+gurabo_status gurabo_tensor_slice(const gurabo_tensor *input, uint32_t axis, uint64_t start,
+                                   uint64_t length, uint64_t step, gurabo_tensor **out);
+/* Change the shape of a contiguous Tensor without moving data. The element
+   count must match. Rank zero represents one scalar and permits NULL extent. */
+gurabo_status gurabo_tensor_reshape(const gurabo_tensor *input, uint32_t rank,
+                                     const uint64_t *extent, gurabo_tensor **out);
+
 #ifdef __cplusplus
 }
 #endif

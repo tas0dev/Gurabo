@@ -32,7 +32,7 @@ static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
     gb_lock(&context->gate);
     gurabo_status status = gb_stream_ready(stream);
     if (status == GURABO_OK && (gb_buffer_unavailable(out->buffer) ||
-                               gb_buffer_unavailable(a->buffer) ||
+                               (a && gb_buffer_unavailable(a->buffer)) ||
                                (b && gb_buffer_unavailable(b->buffer)))) {
         status = gb_fail(GURABO_BACKEND_ERROR, backend->id);
     }
@@ -57,8 +57,11 @@ static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
             if (job) {
                 job->kernel_completion = completion;
             }
-            gurabo_buffer *buffers[] = {out->buffer, a->buffer, b ? b->buffer : NULL};
-            gb_job_end(stream, job, buffers, b ? 3 : 2, result);
+            gurabo_buffer *buffers[3] = {out->buffer};
+            uint32_t count = 1;
+            if (a) buffers[count++] = a->buffer;
+            if (b) buffers[count++] = b->buffer;
+            gb_job_end(stream, job, buffers, count, result);
         }
     }
     gb_unlock(&context->gate);
@@ -76,9 +79,9 @@ static gurabo_status submit_pointwise(gurabo_stream *stream, gurabo_tensor *out,
 {
     gb_pointwise *args = &kernel->args.pointwise;
     args->out = gb_buffer_address(out->buffer, out->offset);
-    args->a = gb_buffer_address(a->buffer, a->offset);
+    args->a = a ? gb_buffer_address(a->buffer, a->offset) : NULL;
     args->b = b ? gb_buffer_address(b->buffer, b->offset) : NULL;
-    args->input_dtype = a->desc.dtype;
+    args->input_dtype = a ? a->desc.dtype : out->desc.dtype;
     args->output_dtype = out->desc.dtype;
     args->count = element_count(out);
     return submit(stream, out, a, b, kernel);
@@ -151,6 +154,65 @@ gurabo_status gurabo_tensor_cast_async(gurabo_stream *stream, gurabo_tensor *out
     }
     gb_kernel kernel = {.kind = GB_KERNEL_POINTWISE, .args.pointwise.op = GB_POINTWISE_CAST};
     return submit_pointwise(stream, out, input, NULL, &kernel);
+}
+
+static gurabo_status check_initializer(gurabo_stream *stream, gurabo_tensor *out)
+{
+    if (!stream || !out) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = stream->context;
+    if (out->buffer->context != context) {
+        return gb_fail(GURABO_CONTEXT_MISMATCH, context->backend->id);
+    }
+    if (!out->contiguous) {
+        return gb_fail(GURABO_UNSUPPORTED, context->backend->id);
+    }
+    return GURABO_OK;
+}
+
+gurabo_status gurabo_tensor_fill_async(gurabo_stream *stream, gurabo_tensor *out,
+                                       const void *value)
+{
+    gurabo_status status = check_initializer(stream, out);
+    if (status != GURABO_OK) {
+        return status;
+    }
+    if (!value) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, stream->context->backend->id);
+    }
+    gb_kernel kernel = {.kind = GB_KERNEL_POINTWISE, .args.pointwise = {
+        .op = GB_POINTWISE_FILL, .element_bytes = (uint32_t)gb_dtype_size(out->desc.dtype)
+    }};
+    memcpy(kernel.args.pointwise.literal, value, kernel.args.pointwise.element_bytes);
+    return submit_pointwise(stream, out, NULL, NULL, &kernel);
+}
+
+gurabo_status gurabo_tensor_zero_async(gurabo_stream *stream, gurabo_tensor *out)
+{
+    const uint64_t zero = 0;
+    return gurabo_tensor_fill_async(stream, out, &zero);
+}
+
+gurabo_status gurabo_tensor_random_uniform_async(gurabo_stream *stream, gurabo_tensor *out,
+                                                 uint64_t seed, uint64_t counter)
+{
+    gurabo_status status = check_initializer(stream, out);
+    if (status != GURABO_OK) {
+        return status;
+    }
+    gurabo_backend id = stream->context->backend->id;
+    if (out->desc.dtype != GURABO_F32) {
+        return gb_fail(GURABO_UNSUPPORTED, id);
+    }
+    uint64_t count = element_count(out);
+    if (count && count - 1 > UINT64_MAX - counter) {
+        return gb_fail(GURABO_OUT_OF_RANGE, id);
+    }
+    gb_kernel kernel = {.kind = GB_KERNEL_POINTWISE, .args.pointwise = {
+        .op = GB_POINTWISE_UNIFORM, .seed = seed, .counter = counter
+    }};
+    return submit_pointwise(stream, out, NULL, NULL, &kernel);
 }
 
 static int make_broadcast(const gurabo_tensor_desc *out, const gurabo_tensor_desc *a,

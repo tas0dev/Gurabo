@@ -226,6 +226,9 @@ gurabo_status gurabo_buffer_read(gurabo_stream *stream, void *dst,
     return transfer(stream, src, offset, dst, NULL, bytes, 0);
 }
 
+/* TODO: 複数GPUに対応する。異なるContext間の直接転送と固定ホストメモリ経由の
+   転送、およびStream上の完了通知を実装する。その上で集合通信
+   （all-reduce、all-gather、reduce-scatter）を追加する。 */
 gurabo_status gurabo_buffer_copy_async(gurabo_stream *stream, gurabo_buffer *dst,
                                        uint64_t dst_offset, const gurabo_buffer *src,
                                        uint64_t src_offset, uint64_t bytes)

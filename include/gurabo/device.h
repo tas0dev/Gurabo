@@ -41,6 +41,7 @@ typedef struct {
 #define GURABO_FEATURE_BINARY_SUB_DIV (UINT64_C(1) << 10)
 #define GURABO_FEATURE_EMBEDDING (UINT64_C(1) << 11)
 #define GURABO_FEATURE_BATCHED_GEMM (UINT64_C(1) << 12)
+#define GURABO_FEATURE_CROSS_ENTROPY (UINT64_C(1) << 13)
 
 gurabo_status gurabo_backend_count(uint32_t *out);
 gurabo_status gurabo_backend_at(uint32_t index, gurabo_backend *out);

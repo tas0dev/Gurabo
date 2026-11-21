@@ -64,7 +64,23 @@ typedef struct {
     unsigned *invalid_index;
 } gb_embedding;
 
-typedef enum { GB_KERNEL_POINTWISE, GB_KERNEL_ROWWISE, GB_KERNEL_EMBEDDING } gb_kernel_kind;
+typedef struct {
+    void *loss;
+    void *gradient;
+    const void *logits;
+    const void *targets;
+    unsigned *invalid_index;
+    uint64_t rows;
+    uint64_t columns;
+    int64_t ignore_index;
+    uint32_t logit_dtype;
+    uint32_t index_bytes;
+    float gradient_scale;
+} gb_cross_entropy;
+
+typedef enum {
+    GB_KERNEL_POINTWISE, GB_KERNEL_ROWWISE, GB_KERNEL_EMBEDDING, GB_KERNEL_CROSS_ENTROPY
+} gb_kernel_kind;
 
 typedef struct {
     gb_kernel_kind kind;
@@ -72,6 +88,7 @@ typedef struct {
         gb_pointwise pointwise;
         gb_rowwise rowwise;
         gb_embedding embedding;
+        gb_cross_entropy cross_entropy;
     } args;
 } gb_kernel;
 
@@ -86,14 +103,16 @@ typedef struct {
 #include <math.h>
 #define GB_KERNEL_EXP expf
 #define GB_KERNEL_ERF erff
+#define GB_KERNEL_LOG logf
+#define GB_KERNEL_LOG1P log1pf
 #endif
 
 #include "float16_bits.h"
 
-GB_KERNEL_INLINE int64_t gb_embedding_index(const gb_embedding *args, uint64_t row)
+GB_KERNEL_INLINE int64_t gb_read_index(const void *base, uint64_t row, uint32_t index_bytes)
 {
-    const unsigned char *indices = (const unsigned char *)args->indices;
-    if (args->index_bytes == sizeof(int32_t)) {
+    const unsigned char *indices = (const unsigned char *)base;
+    if (index_bytes == sizeof(int32_t)) {
         int32_t index;
         GB_KERNEL_MEMCPY(&index, indices + row * sizeof(index), sizeof(index));
         return index;
@@ -185,6 +204,39 @@ GB_KERNEL_INLINE float gb_max_float(float a, float b)
     if (a != a || b != b) return a != a ? a : b;
     if (a == 0.0f && b == 0.0f) return a + b;
     return a > b ? a : b;
+}
+
+GB_KERNEL_INLINE float gb_cross_entropy_term(const gb_cross_entropy *args, uint64_t offset,
+                                              float maximum)
+{
+    return GB_KERNEL_EXP(gb_load_float(args->logits, offset, args->logit_dtype) - maximum);
+}
+
+GB_KERNEL_INLINE void gb_cross_entropy_loss(const gb_cross_entropy *args, uint64_t row,
+                                             int64_t target, float maximum, float others,
+                                             float target_term)
+{
+    float loss = 0.0f;
+    if (target >= 0) {
+        uint64_t offset = row * args->columns + (uint64_t)target;
+        float target_logit = gb_load_float(args->logits, offset, args->logit_dtype);
+        loss = target_term == 1.0f && target_logit == maximum
+             ? GB_KERNEL_LOG1P(others) : (maximum - target_logit) + GB_KERNEL_LOG(others + target_term);
+    }
+    gb_store_float(args->loss, row, GB_POINTWISE_F32, loss);
+}
+
+GB_KERNEL_INLINE void gb_cross_entropy_grad(const gb_cross_entropy *args, uint64_t start,
+                                             uint64_t col, int64_t target, float maximum,
+                                             float others, float target_term)
+{
+    float gradient = 0.0f;
+    if (target >= 0) {
+        float numerator = col == (uint64_t)target
+                        ? -others : gb_cross_entropy_term(args, start + col, maximum);
+        gradient = args->gradient_scale * (numerator / (others + target_term));
+    }
+    gb_store_float(args->gradient, start + col, GB_POINTWISE_F32, gradient);
 }
 
 GB_KERNEL_INLINE uint64_t gb_softmax_mask_base(const gb_rowwise *args, uint64_t row)

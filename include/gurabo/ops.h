@@ -91,6 +91,21 @@ gurabo_status gurabo_softmax_async(gurabo_stream *stream, gurabo_tensor *out,
 gurabo_status gurabo_embedding_async(gurabo_stream *stream, gurabo_tensor *out,
                                      const gurabo_tensor *table, const gurabo_tensor *indices);
 
+/* Sparse cross-entropy over the final, nonempty vocabulary axis of logits.
+   All tensors are contiguous. Targets are signed I32 or I64 with the logits
+   shape minus the last axis. Loss has the targets shape and F32 storage.
+   Logits use F32, F16 or BF16. Optional dlogits matches the logits shape
+   with F32 storage and receives gradient_scale * (softmax - one_hot).
+   gradient_scale is finite and does not affect the unreduced loss. Output
+   ranges are disjoint from one another and from both input ranges.
+   Ignored targets write zero loss and gradient. Other out-of-range targets
+   write zeros and report OUT_OF_RANGE as a Stream execution error.
+   Rows with undefined log-softmax produce NaN loss and gradient. */
+gurabo_status gurabo_cross_entropy_async(gurabo_stream *stream, gurabo_tensor *loss,
+                                         gurabo_tensor *dlogits, const gurabo_tensor *logits,
+                                         const gurabo_tensor *targets, int64_t ignore_index,
+                                         float gradient_scale);
+
 #ifdef __cplusplus
 }
 #endif

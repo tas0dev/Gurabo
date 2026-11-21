@@ -72,7 +72,7 @@ gurabo_status gurabo_tensor_create(gurabo_buffer *buffer, uint64_t byte_offset,
         byte_offset % _Alignof(float) || desc->dtype < GURABO_F32 || desc->dtype > GURABO_I64) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
-    if (desc->dtype != GURABO_F32) {
+    if (desc->dtype != GURABO_F32 || buffer->kind != GB_BUFFER_DEVICE) {
         return gb_fail(GURABO_UNSUPPORTED, id);
     }
     gurabo_tensor tensor = {0};

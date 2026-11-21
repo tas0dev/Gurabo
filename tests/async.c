@@ -16,10 +16,11 @@ static gurabo_status create_status;
 static gurabo_status copy_status;
 static gurabo_status sync_status;
 
-static gb_result alloc_buffer(uint32_t ordinal, size_t bytes, size_t alignment,
+static gb_result alloc_buffer(uint32_t ordinal, gb_buffer_kind kind, size_t bytes, size_t alignment,
                               gb_allocation *out)
 {
     (void)ordinal;
+    (void)kind;
     (void)alignment;
     out->data = malloc(bytes);
     CHECK(out->data);
@@ -28,9 +29,10 @@ static gb_result alloc_buffer(uint32_t ordinal, size_t bytes, size_t alignment,
     return gb_status(GURABO_OK);
 }
 
-static gb_result free_buffer(uint32_t ordinal, gb_allocation allocation)
+static gb_result free_buffer(uint32_t ordinal, gb_buffer_kind kind, gb_allocation allocation)
 {
     (void)ordinal;
+    (void)kind;
     free(allocation.base);
     --live_allocations;
     return gb_status(GURABO_OK);
@@ -95,9 +97,11 @@ static gb_result wait_marker(void *stream, void *marker)
     return gb_status(GURABO_OK);
 }
 
-static gb_result copy_buffer(void *stream, void *dst, const void *src, size_t bytes)
+static gb_result copy_buffer(void *stream, void *dst, const void *src, size_t bytes,
+                             gb_copy_direction direction)
 {
     (void)stream;
+    (void)direction;
     if (copy_status == GURABO_OK) {
         memcpy(dst, src, bytes);
     }
@@ -199,19 +203,26 @@ static void check_event_poll_cleanup(void)
     gurabo_context *context = mock_context();
     gurabo_stream *stream = NULL;
     gurabo_event *event = NULL;
-    gurabo_buffer *buffer = NULL;
+    gurabo_buffer *buffer = NULL, *pinned = NULL;
     CHECK(gurabo_stream_create(context, &stream) == GURABO_OK);
     CHECK(gurabo_event_create(context, &event) == GURABO_OK);
     CHECK(gurabo_buffer_alloc(context, 8, 0, &buffer) == GURABO_OK);
-    memset(buffer->allocation.data, 0, 8);
+    CHECK(gurabo_pinned_buffer_alloc(context, 8, &pinned) == GURABO_OK);
+    void *data = NULL;
+    CHECK(gurabo_pinned_buffer_get_ptr(pinned, &data) == GURABO_OK);
+    memset(data, 0, 8);
     size_t point = markers_created;
-    CHECK(gurabo_buffer_copy_async(stream, buffer, 4, buffer, 0, 4) == GURABO_OK);
-    CHECK(gurabo_event_record(stream, event) == GURABO_OK);
+    CHECK(gurabo_buffer_copy_async(stream, buffer, 0, pinned, 0, 8) == GURABO_OK);
+    CHECK(gurabo_buffer_copy_async(stream, pinned, 0, buffer, 0, 8) == GURABO_OK);
+    CHECK(gurabo_buffer_release(&pinned) == GURABO_OK);
     CHECK(gurabo_buffer_release(&buffer) == GURABO_OK);
+    CHECK(live_allocations == 2);
+    CHECK(gurabo_event_record(stream, event) == GURABO_OK);
     marker_status[point] = GURABO_OK;
     marker_status[point + 1] = GURABO_OK;
+    marker_status[point + 2] = GURABO_OK;
     CHECK(gurabo_event_query(event) == GURABO_OK);
-    CHECK(live_allocations == 1);
+    CHECK(live_allocations == 2);
     CHECK(gurabo_event_release(&event) == GURABO_OK);
     CHECK(gurabo_stream_destroy(&stream) == GURABO_OK);
     CHECK(gurabo_context_destroy(&context) == GURABO_OK);

@@ -67,6 +67,7 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     OK(gurabo_device_get_caps(backend, ordinal, &caps));
     CHECK(caps.storage_dtype_mask == (UINT64_C(1) << GURABO_F32));
     CHECK(caps.feature_mask & GURABO_FEATURE_F32_MATMUL);
+    CHECK(!!(caps.feature_mask & GURABO_FEATURE_PINNED_HOST_MEMORY) == (backend == GURABO_HIP));
     CHECK(caps.max_tensor_rank == GURABO_MAX_RANK && caps.min_buffer_alignment >= sizeof(float));
 
     info.struct_size = (uint32_t)(2 * sizeof(uint32_t));
@@ -231,6 +232,70 @@ static void check_events(gurabo_backend backend, uint32_t ordinal, gurabo_contex
     OK(gurabo_context_destroy(&foreign));
 }
 
+static void check_pinned_memory(gurabo_context *context)
+{
+    const float values[] = {1, 2, 3, 4};
+    const float expected[] = {7, 10, 15, 22};
+    const uint64_t offset = sizeof(float);
+    const uint64_t host_bytes = sizeof(values) + 2 * offset;
+    gurabo_stream *upload = NULL, *compute = NULL;
+    gurabo_event *ready = NULL, *done = NULL;
+    gurabo_buffer *host_in = NULL, *host_out = NULL, *device_in = NULL, *device_out = NULL;
+    gurabo_tensor *input = NULL, *output = NULL;
+    gurabo_tensor_desc shape = matrix_desc(2, 2);
+    void *src = NULL, *dst = NULL;
+
+    OK(gurabo_stream_create(context, &upload));
+    OK(gurabo_stream_create(context, &compute));
+    STATUS(gurabo_pinned_buffer_alloc(context, 0, &host_in), GURABO_INVALID_ARGUMENT);
+    CHECK(host_in == NULL);
+    OK(gurabo_pinned_buffer_alloc(context, host_bytes, &host_in));
+    OK(gurabo_pinned_buffer_alloc(context, host_bytes, &host_out));
+    OK(gurabo_buffer_alloc(context, sizeof(values), 0, &device_in));
+    OK(gurabo_buffer_alloc(context, sizeof(expected), 0, &device_out));
+    STATUS(gurabo_pinned_buffer_get_ptr(device_in, &src), GURABO_UNSUPPORTED);
+    CHECK(src == NULL);
+    STATUS(gurabo_tensor_create(host_in, 0, &shape, &input), GURABO_UNSUPPORTED);
+    CHECK(input == NULL);
+    STATUS(gurabo_buffer_copy_async(upload, host_out, 0, host_in, 0, 1), GURABO_UNSUPPORTED);
+    STATUS(gurabo_buffer_copy_async(upload, device_in, 0, host_in, host_bytes, 1),
+           GURABO_OUT_OF_RANGE);
+    OK(gurabo_pinned_buffer_get_ptr(host_in, &src));
+    OK(gurabo_pinned_buffer_get_ptr(host_out, &dst));
+    memcpy((unsigned char *)src + offset, values, sizeof(values));
+    memset(dst, 0xA5, (size_t)host_bytes);
+    uint64_t usage = 0;
+    OK(gurabo_context_memory_usage(context, &usage));
+    CHECK(usage == 2 * host_bytes + sizeof(values) + sizeof(expected));
+
+    OK(gurabo_tensor_create(device_in, 0, &shape, &input));
+    OK(gurabo_tensor_create(device_out, 0, &shape, &output));
+    OK(gurabo_event_create(context, &ready));
+    OK(gurabo_event_create(context, &done));
+    OK(gurabo_buffer_copy_async(upload, device_in, 0, host_in, offset, sizeof(values)));
+    OK(gurabo_buffer_release(&host_in));
+    OK(gurabo_event_record(upload, ready));
+    OK(gurabo_stream_wait_event(compute, ready));
+    OK(gurabo_event_release(&ready));
+    OK(gurabo_matmul_async(compute, output, input, input, NULL));
+    OK(gurabo_buffer_copy_async(compute, host_out, offset, device_out, 0, sizeof(expected)));
+    OK(gurabo_event_record(compute, done));
+    OK(gurabo_event_synchronize(done));
+    CHECK(memcmp((unsigned char *)dst + offset, expected, sizeof(expected)) == 0);
+    CHECK(((unsigned char *)dst)[0] == 0xA5 && ((unsigned char *)dst)[host_bytes - 1] == 0xA5);
+
+    OK(gurabo_event_release(&done));
+    OK(gurabo_tensor_release(&input));
+    OK(gurabo_tensor_release(&output));
+    OK(gurabo_buffer_release(&device_in));
+    OK(gurabo_buffer_release(&device_out));
+    OK(gurabo_buffer_release(&host_out));
+    OK(gurabo_stream_destroy(&upload));
+    OK(gurabo_stream_destroy(&compute));
+    OK(gurabo_context_memory_usage(context, &usage));
+    CHECK(usage == 0);
+}
+
 static void check_matmul(gurabo_context *context, gurabo_stream *stream,
                          uint32_t trans_a, uint32_t trans_b, float beta,
                          float actual[8])
@@ -333,6 +398,7 @@ int main(int argc, char **argv)
     check_memory(backend, ordinal, context, stream);
     check_layout(context);
     check_events(backend, ordinal, context);
+    check_pinned_memory(context);
     for (uint32_t ta = 0; ta < 2; ++ta) {
         for (uint32_t tb = 0; tb < 2; ++tb) {
             for (int use_beta = 0; use_beta <= 1; ++use_beta) {

@@ -72,6 +72,7 @@ struct gurabo_buffer {
     gurabo_context *context;
     gurabo_buffer *next_retired;
     gb_allocation allocation;
+    gb_buffer_kind kind;
     uint64_t bytes;
     uint64_t references;
     int transfer_in_doubt;

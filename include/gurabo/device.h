@@ -29,6 +29,7 @@ typedef struct {
 #define GURABO_DEVICE_INFO_SIZE ((uint32_t)sizeof(gurabo_device_info))
 #define GURABO_DEVICE_CAPS_SIZE ((uint32_t)sizeof(gurabo_device_caps))
 #define GURABO_FEATURE_F32_MATMUL UINT64_C(1)
+#define GURABO_FEATURE_PINNED_HOST_MEMORY (UINT64_C(1) << 1)
 
 gurabo_status gurabo_backend_count(uint32_t *out);
 gurabo_status gurabo_backend_at(uint32_t index, gurabo_backend *out);

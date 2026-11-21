@@ -1,7 +1,7 @@
 #include "core.h"
 
-gurabo_status gurabo_buffer_alloc(gurabo_context *context, uint64_t bytes,
-                                 uint64_t alignment, gurabo_buffer **out)
+static gurabo_status allocate_buffer(gurabo_context *context, gb_buffer_kind kind,
+                                     uint64_t bytes, uint64_t alignment, gurabo_buffer **out)
 {
     if (!context) {
         return gb_fail(GURABO_INVALID_HANDLE, 0);
@@ -35,10 +35,11 @@ gurabo_status gurabo_buffer_alloc(gurabo_context *context, uint64_t bytes,
         gb_unlock(&context->gate);
         return gb_fail(GURABO_OUT_OF_MEMORY, backend->id);
     }
-    gb_result result = backend->alloc(context->ordinal, (size_t)bytes, (size_t)alignment,
+    gb_result result = backend->alloc(context->ordinal, kind, (size_t)bytes, (size_t)alignment,
                                       &buffer->allocation);
     if (result.status == GURABO_OK) {
         buffer->context = context;
+        buffer->kind = kind;
         buffer->references = 1;
         buffer->bytes = bytes;
         context->allocated_bytes += bytes;
@@ -53,12 +54,48 @@ gurabo_status gurabo_buffer_alloc(gurabo_context *context, uint64_t bytes,
     return gb_call_result(result, backend->id);
 }
 
+gurabo_status gurabo_buffer_alloc(gurabo_context *context, uint64_t bytes,
+                                 uint64_t alignment, gurabo_buffer **out)
+{
+    return allocate_buffer(context, GB_BUFFER_DEVICE, bytes, alignment, out);
+}
+
+gurabo_status gurabo_pinned_buffer_alloc(gurabo_context *context, uint64_t bytes,
+                                        gurabo_buffer **out)
+{
+    return allocate_buffer(context, GB_BUFFER_PINNED, bytes, 0, out);
+}
+
+gurabo_status gurabo_pinned_buffer_get_ptr(gurabo_buffer *buffer, void **out)
+{
+    if (!buffer) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = buffer->context;
+    gurabo_backend id = context->backend->id;
+    if (!out) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    if (buffer->kind != GB_BUFFER_PINNED) {
+        return gb_fail(GURABO_UNSUPPORTED, id);
+    }
+    gb_lock(&context->gate);
+    gurabo_status status = GURABO_OK;
+    if (gb_buffer_unavailable(buffer)) {
+        status = gb_fail(GURABO_BACKEND_ERROR, id);
+    } else {
+        *out = buffer->allocation.data;
+    }
+    gb_unlock(&context->gate);
+    return status;
+}
+
 static gb_result free_buffer(gurabo_buffer *buffer)
 {
     gb_result result = gb_status(GURABO_OK);
     gurabo_context *context = buffer->context;
     if (!buffer->quarantined) {
-        result = context->backend->free(context->ordinal, buffer->allocation);
+        result = context->backend->free(context->ordinal, buffer->kind, buffer->allocation);
         if (result.status == GURABO_OK) {
             context->allocated_bytes -= buffer->bytes;
         } else {
@@ -130,6 +167,9 @@ static gurabo_status transfer(gurabo_stream *stream, const gurabo_buffer *buffer
     if (buffer->context != context) {
         return gb_fail(GURABO_CONTEXT_MISMATCH, backend->id);
     }
+    if (buffer->kind != GB_BUFFER_DEVICE) {
+        return gb_fail(GURABO_UNSUPPORTED, backend->id);
+    }
     if (!gb_range(buffer, offset, bytes)) {
         return gb_fail(GURABO_OUT_OF_RANGE, backend->id);
     }
@@ -198,6 +238,9 @@ gurabo_status gurabo_buffer_copy_async(gurabo_stream *stream, gurabo_buffer *dst
     if (dst->context != context || src->context != context) {
         return gb_fail(GURABO_CONTEXT_MISMATCH, backend->id);
     }
+    if (dst->kind == GB_BUFFER_PINNED && src->kind == GB_BUFFER_PINNED) {
+        return gb_fail(GURABO_UNSUPPORTED, backend->id);
+    }
     if (!gb_range(dst, dst_offset, bytes) || !gb_range(src, src_offset, bytes)) {
         return gb_fail(GURABO_OUT_OF_RANGE, backend->id);
     }
@@ -206,6 +249,12 @@ gurabo_status gurabo_buffer_copy_async(gurabo_stream *stream, gurabo_buffer *dst
     }
     if (!bytes) {
         return GURABO_OK;
+    }
+    gb_copy_direction direction = GB_COPY_DEVICE_TO_DEVICE;
+    if (src->kind == GB_BUFFER_PINNED) {
+        direction = GB_COPY_HOST_TO_DEVICE;
+    } else if (dst->kind == GB_BUFFER_PINNED) {
+        direction = GB_COPY_DEVICE_TO_HOST;
     }
     gb_lock(&context->gate);
     gurabo_status status = gb_stream_ready(stream);
@@ -217,7 +266,8 @@ gurabo_status gurabo_buffer_copy_async(gurabo_stream *stream, gurabo_buffer *dst
         status = gb_job_begin(stream, &job);
         if (status == GURABO_OK) {
             gb_result result = backend->copy(stream->native, gb_buffer_address(dst, dst_offset),
-                                             gb_buffer_address(src, src_offset), (size_t)bytes);
+                                             gb_buffer_address(src, src_offset), (size_t)bytes,
+                                             direction);
             gurabo_buffer *buffers[] = {dst, (gurabo_buffer *)src};
             gb_job_end(stream, job, buffers, 2, result);
         }

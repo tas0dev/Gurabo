@@ -106,10 +106,11 @@ gurabo_status gurabo_device_get_caps(gurabo_backend id, uint32_t ordinal,
         return status;
     }
     gurabo_device_caps caps = {0};
+    const gb_backend *backend = find_backend(id);
     caps.max_tensor_rank = GURABO_MAX_RANK;
     caps.storage_dtype_mask = UINT64_C(1) << GURABO_F32;
-    caps.feature_mask = GURABO_FEATURE_F32_MATMUL;
-    caps.min_buffer_alignment = find_backend(id)->alignment;
+    caps.feature_mask = backend->features;
+    caps.min_buffer_alignment = backend->alignment;
     gb_write_struct(out, &caps, out->struct_size, sizeof(caps));
     return GURABO_OK;
 }

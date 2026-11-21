@@ -16,10 +16,11 @@ static gb_result cpu_info(uint32_t ordinal, gurabo_device_info *info)
     return gb_status(GURABO_OK);
 }
 
-static gb_result cpu_alloc(uint32_t ordinal, size_t bytes, size_t alignment,
+static gb_result cpu_alloc(uint32_t ordinal, gb_buffer_kind kind, size_t bytes, size_t alignment,
                            gb_allocation *allocation)
 {
     (void)ordinal;
+    (void)kind;
     size_t extra = alignment - 1;
     if (bytes > (size_t)PTRDIFF_MAX || extra > (size_t)PTRDIFF_MAX - bytes) {
         return gb_status(GURABO_UNSUPPORTED);
@@ -34,9 +35,10 @@ static gb_result cpu_alloc(uint32_t ordinal, size_t bytes, size_t alignment,
     return gb_status(GURABO_OK);
 }
 
-static gb_result cpu_free(uint32_t ordinal, gb_allocation allocation)
+static gb_result cpu_free(uint32_t ordinal, gb_buffer_kind kind, gb_allocation allocation)
 {
     (void)ordinal;
+    (void)kind;
     free(allocation.base);
     return gb_status(GURABO_OK);
 }
@@ -54,9 +56,11 @@ static gb_result cpu_stream_noop(void *stream)
     return gb_status(GURABO_OK);
 }
 
-static gb_result cpu_copy(void *stream, void *dst, const void *src, size_t bytes)
+static gb_result cpu_copy(void *stream, void *dst, const void *src, size_t bytes,
+                          gb_copy_direction direction)
 {
     (void)stream;
+    (void)direction;
     memcpy(dst, src, bytes);
     return gb_status(GURABO_OK);
 }
@@ -64,9 +68,9 @@ static gb_result cpu_copy(void *stream, void *dst, const void *src, size_t bytes
 static gb_result cpu_transfer(void *stream, void *dst, const void *src, size_t bytes,
                               int to_device, int *unsafe)
 {
-    (void)to_device;
     *unsafe = 0;
-    return cpu_copy(stream, dst, src, bytes);
+    return cpu_copy(stream, dst, src, bytes,
+                    to_device ? GB_COPY_HOST_TO_DEVICE : GB_COPY_DEVICE_TO_HOST);
 }
 
 static float load_f32(const float *buffer, size_t index)
@@ -110,6 +114,7 @@ static gb_result cpu_matmul(void *stream, const gb_matmul *args)
 const gb_backend gb_cpu = {
     .id = GURABO_CPU,
     .alignment = 64,
+    .features = GURABO_FEATURE_F32_MATMUL,
     .device_count = cpu_count,
     .device_info = cpu_info,
     .alloc = cpu_alloc,

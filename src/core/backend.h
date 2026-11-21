@@ -19,6 +19,17 @@ typedef struct {
     void *data;
 } gb_allocation;
 
+typedef enum {
+    GB_BUFFER_DEVICE,
+    GB_BUFFER_PINNED
+} gb_buffer_kind;
+
+typedef enum {
+    GB_COPY_DEVICE_TO_DEVICE,
+    GB_COPY_HOST_TO_DEVICE,
+    GB_COPY_DEVICE_TO_HOST
+} gb_copy_direction;
+
 typedef struct {
     int32_t m, n, k;
     int32_t a_width, b_width;
@@ -32,10 +43,11 @@ typedef struct {
 typedef struct {
     gurabo_backend id;
     uint64_t alignment;
+    uint64_t features;
     gb_result (*device_count)(uint32_t *);
     gb_result (*device_info)(uint32_t ordinal, gurabo_device_info *);
-    gb_result (*alloc)(uint32_t ordinal, size_t, size_t, gb_allocation *);
-    gb_result (*free)(uint32_t ordinal, gb_allocation);
+    gb_result (*alloc)(uint32_t ordinal, gb_buffer_kind, size_t, size_t, gb_allocation *);
+    gb_result (*free)(uint32_t ordinal, gb_buffer_kind, gb_allocation);
     gb_result (*stream_create)(uint32_t ordinal, void **);
     gb_result (*stream_destroy)(void *);
     gb_result (*stream_sync)(void *);
@@ -52,7 +64,8 @@ typedef struct {
        Set unsafe if the device allocation may still be in use after failure. */
     gb_result (*transfer)(void *stream, void *dst, const void *src,
                           size_t bytes, int to_device, int *unsafe);
-    gb_result (*copy)(void *stream, void *dst, const void *src, size_t bytes);
+    gb_result (*copy)(void *stream, void *dst, const void *src, size_t bytes,
+                      gb_copy_direction);
     gb_result (*matmul)(void *stream, const gb_matmul *);
 } gb_backend;
 

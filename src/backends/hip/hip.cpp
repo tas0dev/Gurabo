@@ -99,7 +99,8 @@ gb_result device_info(uint32_t ordinal, gurabo_device_info *info)
     return gb_status(GURABO_OK);
 }
 
-gb_result alloc(uint32_t ordinal, size_t bytes, size_t alignment, gb_allocation *out)
+gb_result alloc(uint32_t ordinal, gb_buffer_kind kind, size_t bytes, size_t alignment,
+                gb_allocation *out)
 {
     const size_t extra = alignment - 1;
     if (bytes > static_cast<size_t>(PTRDIFF_MAX) ||
@@ -111,7 +112,9 @@ gb_result alloc(uint32_t ordinal, size_t bytes, size_t alignment, gb_allocation 
         return hip_result(device.error);
     }
     void *base = nullptr;
-    hipError_t error = hipMalloc(&base, bytes + extra);
+    hipError_t error = kind == GB_BUFFER_PINNED
+                       ? hipHostMalloc(&base, bytes + extra, hipHostMallocDefault)
+                       : hipMalloc(&base, bytes + extra);
     if (error == hipSuccess) {
         uintptr_t address = reinterpret_cast<uintptr_t>(base);
         out->base = base;
@@ -120,10 +123,14 @@ gb_result alloc(uint32_t ordinal, size_t bytes, size_t alignment, gb_allocation 
     return hip_result(error);
 }
 
-gb_result release(uint32_t ordinal, gb_allocation allocation)
+gb_result release(uint32_t ordinal, gb_buffer_kind kind, gb_allocation allocation)
 {
     device_scope device(ordinal);
-    return hip_result(device.error == hipSuccess ? hipFree(allocation.base) : device.error);
+    if (device.error != hipSuccess) {
+        return hip_result(device.error);
+    }
+    return hip_result(kind == GB_BUFFER_PINNED ? hipFreeHost(allocation.base)
+                                               : hipFree(allocation.base));
 }
 
 gb_result stream_create(uint32_t ordinal, void **out)
@@ -290,12 +297,19 @@ gb_result transfer(void *stream, void *dst, const void *src, size_t bytes,
     return hip_result(enqueue);
 }
 
-gb_result copy(void *stream, void *dst, const void *src, size_t bytes)
+gb_result copy(void *stream, void *dst, const void *src, size_t bytes,
+               gb_copy_direction direction)
 {
     auto *native = static_cast<hip_stream *>(stream);
     device_scope device(native->ordinal);
+    hipMemcpyKind kind = hipMemcpyDeviceToDevice;
+    if (direction == GB_COPY_HOST_TO_DEVICE) {
+        kind = hipMemcpyHostToDevice;
+    } else if (direction == GB_COPY_DEVICE_TO_HOST) {
+        kind = hipMemcpyDeviceToHost;
+    }
     return hip_result(device.error == hipSuccess
-                      ? hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, native->stream)
+                      ? hipMemcpyAsync(dst, src, bytes, kind, native->stream)
                       : device.error);
 }
 
@@ -322,6 +336,7 @@ gb_result matmul(void *stream, const gb_matmul *args)
 const gb_backend gb_hip = {
     GURABO_HIP,
     256,
+    GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_PINNED_HOST_MEMORY,
     count_devices,
     device_info,
     alloc,

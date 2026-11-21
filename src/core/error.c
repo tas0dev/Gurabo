@@ -3,11 +3,6 @@
 
 static _Thread_local gurabo_error_info thread_error;
 
-uint32_t gurabo_abi_version(void)
-{
-    return GURABO_ABI_VERSION;
-}
-
 const char *gurabo_status_string(gurabo_status status)
 {
     static const char *const messages[] = {

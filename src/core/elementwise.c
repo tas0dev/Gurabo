@@ -18,8 +18,7 @@ static int overlaps(const gurabo_tensor *out, const gurabo_tensor *input)
 }
 
 static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
-                            const gurabo_tensor *a, const gurabo_tensor *b,
-                            gurabo_tensor *extra_out, const gb_kernel *kernel)
+                            const gurabo_tensor *a, const gurabo_tensor *b, const gb_kernel *kernel)
 {
     if (!out->span) {
         return GURABO_OK;
@@ -34,8 +33,7 @@ static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
     gurabo_status status = gb_stream_ready(stream);
     if (status == GURABO_OK && (gb_buffer_unavailable(out->buffer) ||
                                gb_buffer_unavailable(a->buffer) ||
-                               (b && gb_buffer_unavailable(b->buffer)) ||
-                               (extra_out && gb_buffer_unavailable(extra_out->buffer)))) {
+                               (b && gb_buffer_unavailable(b->buffer)))) {
         status = gb_fail(GURABO_BACKEND_ERROR, backend->id);
     }
     if (status == GURABO_OK && backend->kernel_prepare && !context->kernel_state) {
@@ -59,15 +57,8 @@ static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
             if (job) {
                 job->kernel_completion = completion;
             }
-            gurabo_buffer *buffers[4] = {out->buffer, a->buffer};
-            uint32_t count = 2;
-            if (b) {
-                buffers[count++] = b->buffer;
-            }
-            if (extra_out) {
-                buffers[count++] = extra_out->buffer;
-            }
-            gb_job_end(stream, job, buffers, count, result);
+            gurabo_buffer *buffers[] = {out->buffer, a->buffer, b ? b->buffer : NULL};
+            gb_job_end(stream, job, buffers, b ? 3 : 2, result);
         }
     }
     gb_unlock(&context->gate);
@@ -90,7 +81,7 @@ static gurabo_status submit_pointwise(gurabo_stream *stream, gurabo_tensor *out,
     args->input_dtype = a->desc.dtype;
     args->output_dtype = out->desc.dtype;
     args->count = element_count(out);
-    return submit(stream, out, a, b, NULL, kernel);
+    return submit(stream, out, a, b, kernel);
 }
 
 static int shape_equal(const gurabo_tensor_desc *a, const gurabo_tensor_desc *b)
@@ -217,7 +208,7 @@ gurabo_status gurabo_reduce_async(gurabo_stream *stream, gurabo_reduction op,
         .op = op,
         .input_dtype = input->desc.dtype
     }};
-    return submit(stream, out, input, NULL, NULL, &kernel);
+    return submit(stream, out, input, NULL, &kernel);
 }
 
 gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
@@ -260,7 +251,7 @@ gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
         .scale_dtype = scale ? scale->desc.dtype : 0,
         .epsilon = epsilon
     }};
-    return submit(stream, out, input, scale, NULL, &kernel);
+    return submit(stream, out, input, scale, &kernel);
 }
 
 gurabo_status gurabo_activation_async(gurabo_stream *stream, gurabo_activation op,
@@ -342,7 +333,7 @@ gurabo_status gurabo_softmax_async(gurabo_stream *stream, gurabo_tensor *out,
     if (keep_mask && !make_softmax_mask(&kernel.args.rowwise, &input->desc, &keep_mask->desc)) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
-    return submit(stream, out, input, keep_mask, NULL, &kernel);
+    return submit(stream, out, input, keep_mask, &kernel);
 }
 
 gurabo_status gurabo_embedding_async(gurabo_stream *stream, gurabo_tensor *out,
@@ -380,52 +371,7 @@ gurabo_status gurabo_embedding_async(gurabo_stream *stream, gurabo_tensor *out,
         .element_bytes = (uint32_t)gb_dtype_size(table->desc.dtype),
         .index_bytes = (uint32_t)gb_dtype_size(indices->desc.dtype)
     }};
-    return submit(stream, out, table, indices, NULL, &kernel);
-}
-
-gurabo_status gurabo_cross_entropy_async(gurabo_stream *stream, gurabo_tensor *loss,
-                                         gurabo_tensor *dlogits, const gurabo_tensor *logits,
-                                         const gurabo_tensor *targets, int64_t ignore_index,
-                                         float gradient_scale)
-{
-    if (!stream || !loss || !logits || !targets) {
-        return gb_fail(GURABO_INVALID_HANDLE, 0);
-    }
-    gurabo_context *context = stream->context;
-    gurabo_backend id = context->backend->id;
-    if (loss->buffer->context != context || logits->buffer->context != context ||
-        targets->buffer->context != context || (dlogits && dlogits->buffer->context != context)) {
-        return gb_fail(GURABO_CONTEXT_MISMATCH, id);
-    }
-    uint32_t rank = targets->desc.rank;
-    if (logits->desc.rank != rank + 1 || !logits->desc.extent[rank] ||
-        memcmp(logits->desc.extent, targets->desc.extent, rank * sizeof(logits->desc.extent[0])) != 0 ||
-        !isfinite(gradient_scale) || !shape_equal(&loss->desc, &targets->desc) ||
-        overlaps(loss, logits) || overlaps(loss, targets) ||
-        (dlogits && (!shape_equal(&dlogits->desc, &logits->desc) || overlaps(dlogits, logits) ||
-                     overlaps(dlogits, targets) || overlaps(dlogits, loss)))) {
-        return gb_fail(GURABO_INVALID_ARGUMENT, id);
-    }
-    if (loss->desc.dtype != GURABO_F32 || !gb_floating_dtype(logits->desc.dtype) ||
-        (targets->desc.dtype != GURABO_I32 && targets->desc.dtype != GURABO_I64) ||
-        !loss->contiguous || !logits->contiguous || !targets->contiguous ||
-        (dlogits && (dlogits->desc.dtype != GURABO_F32 || !dlogits->contiguous))) {
-        return gb_fail(GURABO_UNSUPPORTED, id);
-    }
-
-    gb_kernel kernel = {.kind = GB_KERNEL_CROSS_ENTROPY, .args.cross_entropy = {
-        .loss = gb_buffer_address(loss->buffer, loss->offset),
-        .gradient = dlogits ? gb_buffer_address(dlogits->buffer, dlogits->offset) : NULL,
-        .logits = gb_buffer_address(logits->buffer, logits->offset),
-        .targets = gb_buffer_address(targets->buffer, targets->offset),
-        .rows = element_count(targets),
-        .columns = logits->desc.extent[rank],
-        .ignore_index = ignore_index,
-        .logit_dtype = logits->desc.dtype,
-        .index_bytes = (uint32_t)gb_dtype_size(targets->desc.dtype),
-        .gradient_scale = gradient_scale
-    }};
-    return submit(stream, loss, logits, targets, dlogits, &kernel);
+    return submit(stream, out, table, indices, &kernel);
 }
 
 gurabo_status gurabo_axpby_async(gurabo_stream *stream, gurabo_tensor *out,

@@ -5,15 +5,11 @@ using int32_t = int;
 using int64_t = long long;
 
 extern "C" __device__ float __ocml_erf_f32(float);
-extern "C" __device__ float __ocml_log_f32(float);
-extern "C" __device__ float __ocml_log1p_f32(float);
 
 #define GB_KERNEL_INLINE static __device__ __forceinline__
 #define GB_KERNEL_MEMCPY __builtin_memcpy
 #define GB_KERNEL_EXP __builtin_expf
 #define GB_KERNEL_ERF __ocml_erf_f32
-#define GB_KERNEL_LOG __ocml_log_f32
-#define GB_KERNEL_LOG1P __ocml_log1p_f32
 #include "pointwise.h"
 
 extern "C" __global__ void gurabo_pointwise(gb_pointwise args)
@@ -105,7 +101,7 @@ extern "C" __global__ void gurabo_embedding(gb_embedding args)
     unsigned char *out = (unsigned char *)args.out;
     const unsigned char *table = (const unsigned char *)args.table;
     for (uint64_t row = blockIdx.x; row < args.index_count; row += gridDim.x) {
-        int64_t index = gb_read_index(args.indices, row, args.index_bytes);
+        int64_t index = gb_embedding_index(&args, row);
         bool valid = index >= 0 && (uint64_t)index < args.vocabulary;
         if (!valid && threadIdx.x == 0) {
             atomicExch(args.invalid_index, 1u);
@@ -121,48 +117,6 @@ extern "C" __global__ void gurabo_embedding(gb_embedding args)
                 uint16_t bits = 0;
                 if (valid) __builtin_memcpy(&bits, table + src, sizeof(bits));
                 __builtin_memcpy(out + dst, &bits, sizeof(bits));
-            }
-        }
-    }
-}
-
-extern "C" __global__ void gurabo_cross_entropy(gb_cross_entropy args)
-{
-    __shared__ float partial[GB_ROW_THREADS];
-    unsigned tid = threadIdx.x;
-    for (uint64_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
-        uint64_t start = row * args.columns;
-        int64_t target = gb_read_index(args.targets, row, args.index_bytes);
-        float maximum = gb_float_from_bits(0xFF800000u);
-        float others = 0.0f;
-        float target_term = 0.0f;
-        if (target == args.ignore_index) {
-            target = -1;
-        } else if (target < 0 || (uint64_t)target >= args.columns) {
-            if (tid == 0) {
-                atomicExch(args.invalid_index, 1u);
-            }
-            target = -1;
-        } else {
-            for (uint64_t col = tid; col < args.columns; col += blockDim.x) {
-                maximum = gb_max_float(maximum,
-                                       gb_load_float(args.logits, start + col, args.logit_dtype));
-            }
-            maximum = block_reduce(partial, maximum, true);
-            for (uint64_t col = tid; col < args.columns; col += blockDim.x) {
-                if (col != (uint64_t)target) {
-                    others += gb_cross_entropy_term(&args, start + col, maximum);
-                }
-            }
-            others = block_reduce(partial, others, false);
-            target_term = gb_cross_entropy_term(&args, start + (uint64_t)target, maximum);
-        }
-        if (tid == 0) {
-            gb_cross_entropy_loss(&args, row, target, maximum, others, target_term);
-        }
-        if (args.gradient) {
-            for (uint64_t col = tid; col < args.columns; col += blockDim.x) {
-                gb_cross_entropy_grad(&args, start, col, target, maximum, others, target_term);
             }
         }
     }

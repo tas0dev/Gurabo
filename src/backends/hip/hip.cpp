@@ -75,8 +75,8 @@ private:
     bool changed = false;
 };
 
-struct index_result {
-    index_result *next = nullptr;
+struct embedding_result {
+    embedding_result *next = nullptr;
     unsigned *host = nullptr;
     unsigned *device = nullptr;
 };
@@ -86,8 +86,7 @@ struct kernel_module {
     hipFunction_t pointwise = nullptr;
     hipFunction_t rowwise = nullptr;
     hipFunction_t embedding = nullptr;
-    hipFunction_t cross_entropy = nullptr;
-    index_result *available_results = nullptr;
+    embedding_result *available_results = nullptr;
 };
 
 gb_result hiprtc_result(hiprtcResult error, hiprtcProgram program)
@@ -166,10 +165,6 @@ gb_result kernel_prepare(uint32_t ordinal, void **state)
         if (error == hipSuccess) {
             error = hipModuleGetFunction(&module->embedding, module->module, "gurabo_embedding");
         }
-        if (error == hipSuccess) {
-            error = hipModuleGetFunction(&module->cross_entropy, module->module,
-                                         "gurabo_cross_entropy");
-        }
         if (error != hipSuccess) {
             (void)hipModuleUnload(module->module);
         }
@@ -186,7 +181,7 @@ gb_result kernel_release(uint32_t ordinal, void *state)
     device_scope device(ordinal);
     hipError_t first = device.error == hipSuccess ? hipModuleUnload(module->module) : device.error;
     while (module->available_results) {
-        auto result = std::unique_ptr<index_result>(module->available_results);
+        auto result = std::unique_ptr<embedding_result>(module->available_results);
         module->available_results = result->next;
         if (device.error == hipSuccess) {
             hipError_t free_device = hipFree(result->device);
@@ -199,14 +194,14 @@ gb_result kernel_release(uint32_t ordinal, void *state)
     return hip_result(first);
 }
 
-gb_result take_index_result(kernel_module *module, index_result **out)
+gb_result take_embedding_result(kernel_module *module, embedding_result **out)
 {
     if (module->available_results) {
         *out = module->available_results;
         module->available_results = (*out)->next;
         return gb_status(GURABO_OK);
     }
-    auto result = std::unique_ptr<index_result>(new (std::nothrow) index_result);
+    auto result = std::unique_ptr<embedding_result>(new (std::nothrow) embedding_result);
     if (!result) {
         return gb_status(GURABO_OUT_OF_MEMORY);
     }
@@ -229,7 +224,7 @@ gb_result take_index_result(kernel_module *module, index_result **out)
 gb_result kernel_complete(void *state, void *completion)
 {
     auto *module = static_cast<kernel_module *>(state);
-    auto *result = static_cast<index_result *>(completion);
+    auto *result = static_cast<embedding_result *>(completion);
     unsigned invalid = *result->host;
     result->next = module->available_results;
     module->available_results = result;
@@ -250,18 +245,22 @@ gb_result kernel_launch(void *stream, void *state, const gb_kernel *kernel, void
     hipFunction_t function;
     uint64_t blocks;
     void *kernel_args[1];
-    unsigned **invalid_index = nullptr;
+    embedding_result *result = nullptr;
     if (kernel->kind == GB_KERNEL_EMBEDDING) {
         auto &args = parameters.args.embedding;
-        invalid_index = &args.invalid_index;
+        gb_result acquired = take_embedding_result(module, &result);
+        if (acquired.status != GURABO_OK) {
+            return acquired;
+        }
+        *completion = result;
+        *result->host = 0;
+        args.invalid_index = result->device;
+        hipError_t error = hipMemsetAsync(result->device, 0, sizeof(unsigned), native->stream);
+        if (error != hipSuccess) {
+            return hip_result(error);
+        }
         blocks = args.index_count;
         function = module->embedding;
-        kernel_args[0] = &args;
-    } else if (kernel->kind == GB_KERNEL_CROSS_ENTROPY) {
-        auto &args = parameters.args.cross_entropy;
-        invalid_index = &args.invalid_index;
-        blocks = args.rows;
-        function = module->cross_entropy;
         kernel_args[0] = &args;
     } else if (kernel->kind == GB_KERNEL_ROWWISE) {
         const gb_rowwise &args = kernel->args.rowwise;
@@ -276,20 +275,6 @@ gb_result kernel_launch(void *stream, void *state, const gb_kernel *kernel, void
         blocks = (kernel->args.pointwise.count + threads - 1) / threads;
         function = module->pointwise;
         kernel_args[0] = &parameters.args.pointwise;
-    }
-    index_result *result = nullptr;
-    if (invalid_index) {
-        gb_result acquired = take_index_result(module, &result);
-        if (acquired.status != GURABO_OK) {
-            return acquired;
-        }
-        *completion = result;
-        *result->host = 0;
-        *invalid_index = result->device;
-        hipError_t error = hipMemsetAsync(result->device, 0, sizeof(unsigned), native->stream);
-        if (error != hipSuccess) {
-            return hip_result(error);
-        }
     }
     unsigned grid = blocks < max_blocks ? static_cast<unsigned>(blocks) : max_blocks;
     hipError_t error = hipModuleLaunchKernel(function, grid, 1, 1, threads, 1, 1,
@@ -598,8 +583,7 @@ const gb_backend gb_hip = {
         GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL |
         GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM |
         GURABO_FEATURE_ACTIVATION | GURABO_FEATURE_SOFTMAX | GURABO_FEATURE_BINARY_SUB_DIV |
-        GURABO_FEATURE_EMBEDDING | GURABO_FEATURE_BATCHED_GEMM |
-        GURABO_FEATURE_CROSS_ENTROPY | GURABO_FEATURE_AXPBY,
+        GURABO_FEATURE_EMBEDDING | GURABO_FEATURE_BATCHED_GEMM | GURABO_FEATURE_AXPBY,
     count_devices,
     device_info,
     alloc,

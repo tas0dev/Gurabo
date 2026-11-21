@@ -44,7 +44,6 @@ static gurabo_tensor_desc matrix_desc(uint64_t height, uint64_t width)
 
 static void check_discovery(gurabo_backend backend, uint32_t ordinal)
 {
-    CHECK(gurabo_abi_version() == GURABO_ABI_VERSION);
     uint32_t count = 0;
     OK(gurabo_backend_count(&count));
     gurabo_backend last = 0;
@@ -83,7 +82,6 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     CHECK(caps.feature_mask & GURABO_FEATURE_EMBEDDING);
     CHECK(caps.feature_mask & GURABO_FEATURE_BINARY_SUB_DIV);
     CHECK(caps.feature_mask & GURABO_FEATURE_BATCHED_GEMM);
-    CHECK(caps.feature_mask & GURABO_FEATURE_CROSS_ENTROPY);
     CHECK(caps.feature_mask & GURABO_FEATURE_AXPBY);
     CHECK(!!(caps.feature_mask & GURABO_FEATURE_PINNED_HOST_MEMORY) == (backend == GURABO_HIP));
     CHECK(caps.max_tensor_rank == GURABO_MAX_RANK && caps.min_buffer_alignment >= sizeof(float));
@@ -764,11 +762,11 @@ static void check_embedding_failure(gurabo_backend backend, uint32_t ordinal)
     STATUS(gurabo_context_destroy(&context), GURABO_OUT_OF_RANGE);
 }
 
-static void check_gradient_accumulation(gurabo_context *context, gurabo_stream *stream)
+static void check_axpby(gurabo_context *context, gurabo_stream *stream)
 {
     struct accumulation_storage {
-        float gradient[3];
-        uint16_t microbatch_a[3], microbatch_b[3];
+        float out[3];
+        uint16_t input_a[3], input_b[3];
     };
     const struct accumulation_storage initial = {
         {NAN, NAN, NAN},
@@ -776,203 +774,33 @@ static void check_gradient_accumulation(gurabo_context *context, gurabo_stream *
         {0x4080, 0x4100, 0xC080}  /* BF16: 4, 8, -4 */
     };
     gurabo_buffer *buffer = NULL;
-    gurabo_tensor *gradient = NULL, *a = NULL, *b = NULL, *overlap = NULL;
+    gurabo_tensor *out = NULL, *a = NULL, *b = NULL, *overlap = NULL;
     OK(gurabo_buffer_alloc(context, sizeof(initial), 0, &buffer));
     OK(gurabo_buffer_write(stream, buffer, 0, &initial, sizeof(initial)));
     gurabo_tensor_desc shape = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = GURABO_F32,
                                 .rank = 1, .extent = {3}};
-    OK(gurabo_tensor_create(buffer, 0, &shape, &gradient));
+    OK(gurabo_tensor_create(buffer, 0, &shape, &out));
     OK(gurabo_tensor_create(buffer, sizeof(float), &shape, &overlap));
     shape.dtype = GURABO_F16;
-    OK(gurabo_tensor_create(buffer, offsetof(struct accumulation_storage, microbatch_a), &shape, &a));
+    OK(gurabo_tensor_create(buffer, offsetof(struct accumulation_storage, input_a), &shape, &a));
     shape.dtype = GURABO_BF16;
-    OK(gurabo_tensor_create(buffer, offsetof(struct accumulation_storage, microbatch_b), &shape, &b));
-    STATUS(gurabo_axpby_async(stream, gradient, overlap, 1, 0), GURABO_INVALID_ARGUMENT);
-    STATUS(gurabo_axpby_async(stream, gradient, a, NAN, 0), GURABO_INVALID_ARGUMENT);
-    OK(gurabo_axpby_async(stream, gradient, a, 0.5f, 0));
-    OK(gurabo_axpby_async(stream, gradient, b, 0.5f, 1));
-    OK(gurabo_axpby_async(stream, gradient, gradient, 0, 0.5f));
+    OK(gurabo_tensor_create(buffer, offsetof(struct accumulation_storage, input_b), &shape, &b));
+    STATUS(gurabo_axpby_async(stream, out, overlap, 1, 0), GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_axpby_async(stream, out, a, NAN, 0), GURABO_INVALID_ARGUMENT);
+    OK(gurabo_axpby_async(stream, out, a, 0.5f, 0));
+    OK(gurabo_axpby_async(stream, out, b, 0.5f, 1));
+    OK(gurabo_axpby_async(stream, out, out, 0, 0.5f));
     float actual[3];
     OK(gurabo_buffer_read(stream, actual, buffer, 0, sizeof(actual)));
     CHECK(actual[0] == 1.5f && actual[1] == 1.0f && actual[2] == 0.5f);
-    OK(gurabo_axpby_async(stream, gradient, gradient, 0, 0));
+    OK(gurabo_axpby_async(stream, out, out, 0, 0));
     OK(gurabo_buffer_read(stream, actual, buffer, 0, sizeof(actual)));
     CHECK(actual[0] == 0 && actual[1] == 0 && actual[2] == 0);
     OK(gurabo_tensor_release(&overlap));
     OK(gurabo_tensor_release(&b));
     OK(gurabo_tensor_release(&a));
-    OK(gurabo_tensor_release(&gradient));
+    OK(gurabo_tensor_release(&out));
     OK(gurabo_buffer_release(&buffer));
-}
-
-static void check_language_model_training(gurabo_context *context, gurabo_stream *stream,
-                                          gurabo_dtype dtype)
-{
-    enum { VOCABULARY = 3, STEPS = 32 };
-    const float one_hot[] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-    const float zero[9] = {0};
-    const int32_t next_token[] = {1, 2, 0};
-    struct training_storage {
-        float input[9], weight[9], logits[9], gradient[9], loss[3];
-        int32_t targets[3];
-        uint16_t input_narrow[9], weight_narrow[9], logits_narrow[9];
-    };
-    gurabo_buffer *buffer = NULL;
-    gurabo_tensor *input = NULL, *weight = NULL, *logits = NULL, *gradient = NULL;
-    gurabo_tensor *loss = NULL, *targets = NULL;
-    gurabo_tensor *input_narrow = NULL, *weight_narrow = NULL, *logits_narrow = NULL;
-    OK(gurabo_buffer_alloc(context, sizeof(struct training_storage), 0, &buffer));
-    gurabo_tensor_desc matrix = matrix_desc(VOCABULARY, VOCABULARY);
-    gurabo_tensor_desc vector = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = GURABO_F32,
-                                 .rank = 1, .extent = {VOCABULARY}};
-    OK(gurabo_tensor_create(buffer, offsetof(struct training_storage, input), &matrix, &input));
-    OK(gurabo_tensor_create(buffer, offsetof(struct training_storage, weight), &matrix, &weight));
-    OK(gurabo_tensor_create(buffer, offsetof(struct training_storage, logits), &matrix, &logits));
-    OK(gurabo_tensor_create(buffer, offsetof(struct training_storage, gradient), &matrix, &gradient));
-    OK(gurabo_tensor_create(buffer, offsetof(struct training_storage, loss), &vector, &loss));
-    vector.dtype = GURABO_I32;
-    OK(gurabo_tensor_create(buffer, offsetof(struct training_storage, targets), &vector, &targets));
-    matrix.dtype = dtype;
-    OK(gurabo_tensor_create(buffer, offsetof(struct training_storage, input_narrow), &matrix,
-                            &input_narrow));
-    OK(gurabo_tensor_create(buffer, offsetof(struct training_storage, weight_narrow), &matrix,
-                            &weight_narrow));
-    OK(gurabo_tensor_create(buffer, offsetof(struct training_storage, logits_narrow), &matrix,
-                            &logits_narrow));
-    OK(gurabo_buffer_write(stream, buffer, offsetof(struct training_storage, input),
-                           one_hot, sizeof(one_hot)));
-    OK(gurabo_buffer_write(stream, buffer, offsetof(struct training_storage, weight), zero, sizeof(zero)));
-    OK(gurabo_buffer_write(stream, buffer, offsetof(struct training_storage, targets),
-                           next_token, sizeof(next_token)));
-    OK(gurabo_tensor_cast_async(stream, input_narrow, input));
-    const gurabo_matmul_desc sgd = {GURABO_MATMUL_DESC_SIZE, 1, 0, -1.0f, 1.0f};
-    for (int step = 0; step <= STEPS; ++step) {
-        OK(gurabo_tensor_cast_async(stream, weight_narrow, weight));
-        OK(gurabo_gemm_async(stream, logits, input_narrow, weight_narrow, NULL));
-        OK(gurabo_tensor_cast_async(stream, logits_narrow, logits));
-        OK(gurabo_cross_entropy_async(stream, loss, gradient, logits_narrow, targets,
-                                      -100, 1.0f / VOCABULARY));
-        if (step == 0 || step == STEPS) {
-            float actual[VOCABULARY];
-            OK(gurabo_buffer_read(stream, actual, buffer, offsetof(struct training_storage, loss),
-                                  sizeof(actual)));
-            for (int i = 0; i < VOCABULARY; ++i) {
-                if (step == 0) {
-                    CHECK(fabsf(actual[i] - logf(VOCABULARY)) < 2e-6f);
-                } else {
-                    CHECK(actual[i] > 0 && actual[i] < 0.1f);
-                }
-            }
-            printf("%s bigram training step %d loss %.6f\n", dtype == GURABO_F16 ? "FP16" : "BF16",
-                   step, actual[0]);
-        }
-        if (step < STEPS) {
-            OK(gurabo_gemm_async(stream, weight, input, gradient, &sgd));
-        }
-    }
-    float learned[VOCABULARY][VOCABULARY];
-    OK(gurabo_buffer_read(stream, learned, buffer, offsetof(struct training_storage, weight),
-                          sizeof(learned)));
-    for (int i = 0; i < VOCABULARY; ++i) {
-        for (int j = 0; j < VOCABULARY; ++j) {
-            if (j != next_token[i]) {
-                CHECK(learned[i][next_token[i]] > learned[i][j]);
-            }
-        }
-    }
-    gurabo_tensor **tensors[] = {&input, &weight, &logits, &gradient, &loss, &targets,
-                                &input_narrow, &weight_narrow, &logits_narrow};
-    for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); ++i) {
-        OK(gurabo_tensor_release(tensors[i]));
-    }
-    OK(gurabo_buffer_release(&buffer));
-}
-
-static void check_cross_entropy(gurabo_backend backend, uint32_t ordinal)
-{
-    enum { ROWS = 3, VOCABULARY = 513 };
-    float logits[ROWS][VOCABULARY], actual_grad[ROWS][VOCABULARY], actual_loss[ROWS];
-    int64_t targets[ROWS] = {400, -100, 0};
-    for (int col = 0; col < VOCABULARY; ++col) {
-        logits[0][col] = 10000.0f + (float)(col % 17) * 0.5f;
-        logits[1][col] = NAN;
-        logits[2][col] = -INFINITY;
-    }
-    gurabo_context *context = NULL;
-    gurabo_stream *stream = NULL, *readback = NULL;
-    gurabo_buffer *buffer = NULL;
-    gurabo_tensor *input = NULL, *labels = NULL, *loss = NULL, *gradient = NULL;
-    const size_t target_offset = 0;
-    const size_t input_offset = sizeof(targets);
-    const size_t loss_offset = input_offset + sizeof(logits);
-    const size_t gradient_offset = loss_offset + sizeof(actual_loss);
-    OK(gurabo_context_create(backend, ordinal, &context));
-    OK(gurabo_stream_create(context, &stream));
-    OK(gurabo_stream_create(context, &readback));
-    OK(gurabo_buffer_alloc(context, gradient_offset + sizeof(actual_grad), 0, &buffer));
-    gurabo_tensor_desc matrix = matrix_desc(ROWS, VOCABULARY);
-    gurabo_tensor_desc vector = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = GURABO_F32,
-                                 .rank = 1, .extent = {ROWS}};
-    OK(gurabo_tensor_create(buffer, input_offset, &matrix, &input));
-    OK(gurabo_tensor_create(buffer, gradient_offset, &matrix, &gradient));
-    OK(gurabo_tensor_create(buffer, loss_offset, &vector, &loss));
-    vector.dtype = GURABO_I64;
-    OK(gurabo_tensor_create(buffer, target_offset, &vector, &labels));
-    OK(gurabo_buffer_write(stream, buffer, input_offset, logits, sizeof(logits)));
-    OK(gurabo_buffer_write(stream, buffer, target_offset, targets, sizeof(targets)));
-    STATUS(gurabo_cross_entropy_async(stream, loss, input, input, labels, -100, 1),
-           GURABO_INVALID_ARGUMENT);
-    STATUS(gurabo_cross_entropy_async(stream, loss, gradient, input, labels, -100, INFINITY),
-           GURABO_INVALID_ARGUMENT);
-    OK(gurabo_cross_entropy_async(stream, loss, NULL, input, labels, -100, 1));
-    OK(gurabo_buffer_read(stream, actual_loss, buffer, loss_offset, sizeof(actual_loss)));
-    double sum = 0;
-    for (int col = 0; col < VOCABULARY; ++col) {
-        sum += exp((double)logits[0][col] - 10008.0);
-    }
-    double expected_loss = log(sum) + (10008.0 - logits[0][targets[0]]);
-    CHECK(fabs(actual_loss[0] - expected_loss) < 2e-6);
-    CHECK(actual_loss[1] == 0 && isnan(actual_loss[2]));
-
-    OK(gurabo_cross_entropy_async(stream, loss, gradient, input, labels, -100, 2));
-    OK(gurabo_buffer_read(stream, actual_grad, buffer, gradient_offset, sizeof(actual_grad)));
-    for (int col = 0; col < VOCABULARY; ++col) {
-        double probability = exp((double)logits[0][col] - 10008.0) / sum;
-        CHECK(fabs(actual_grad[0][col] - 2 * (probability - (col == targets[0]))) < 4e-7);
-        CHECK(actual_grad[1][col] == 0 && isnan(actual_grad[2][col]));
-    }
-    memset(logits[2], 0, sizeof(logits[2]));
-    logits[2][0] = 30.0f;
-    OK(gurabo_buffer_write(stream, buffer, input_offset + 2 * sizeof(logits[2]),
-                           logits[2], sizeof(logits[2])));
-    OK(gurabo_cross_entropy_async(stream, loss, gradient, input, labels, -100, 1));
-    OK(gurabo_buffer_read(stream, actual_loss, buffer, loss_offset, sizeof(actual_loss)));
-    OK(gurabo_buffer_read(stream, actual_grad, buffer, gradient_offset, sizeof(actual_grad)));
-    double others = (VOCABULARY - 1) * exp(-30.0);
-    CHECK(fabs(actual_loss[2] - log1p(others)) < others * 1e-5);
-    CHECK(fabs(actual_grad[2][0] + others / (1.0 + others)) < others * 1e-5);
-
-    targets[2] = INT64_MAX;
-    OK(gurabo_buffer_write(stream, buffer, target_offset, targets, sizeof(targets)));
-    OK(gurabo_cross_entropy_async(stream, loss, gradient, input, labels, -100, 1));
-    OK(gurabo_tensor_release(&labels));
-    OK(gurabo_tensor_release(&loss));
-    OK(gurabo_tensor_release(&gradient));
-    OK(gurabo_tensor_release(&input));
-    STATUS(gurabo_stream_synchronize(stream), GURABO_OUT_OF_RANGE);
-    gurabo_error_info error = {.struct_size = GURABO_ERROR_INFO_SIZE};
-    OK(gurabo_stream_get_error(stream, &error));
-    CHECK(error.phase == GURABO_ERROR_EXECUTION && error.submission_id != 0);
-    OK(gurabo_buffer_read(readback, actual_loss, buffer, loss_offset, sizeof(actual_loss)));
-    OK(gurabo_buffer_read(readback, actual_grad, buffer, gradient_offset, sizeof(actual_grad)));
-    CHECK(fabs(actual_loss[0] - expected_loss) < 2e-6 && actual_loss[2] == 0);
-    for (int col = 0; col < VOCABULARY; ++col) {
-        CHECK(actual_grad[2][col] == 0);
-    }
-    OK(gurabo_buffer_release(&buffer));
-    OK(gurabo_stream_destroy(&readback));
-    STATUS(gurabo_stream_destroy(&stream), GURABO_OUT_OF_RANGE);
-    STATUS(gurabo_context_destroy(&context), GURABO_OUT_OF_RANGE);
 }
 
 enum { GEMM_MAX_BATCH = 2, GEMM_OUTPUT_SIZE = 8 };
@@ -1157,9 +985,7 @@ int main(int argc, char **argv)
     check_empty_reduction(context, stream);
     check_rms_chain(context, stream);
     check_softmax_activation(context, stream);
-    check_gradient_accumulation(context, stream);
-    check_language_model_training(context, stream, GURABO_F16);
-    check_language_model_training(context, stream, GURABO_BF16);
+    check_axpby(context, stream);
     check_float16_conversion();
     for (gurabo_dtype dtype = GURABO_F32; dtype <= GURABO_BF16; ++dtype) {
         double max_input_rounding = 0;
@@ -1213,6 +1039,5 @@ int main(int argc, char **argv)
     OK(gurabo_context_destroy(&cpu_context));
     CHECK(!context && !stream);
     check_embedding_failure(backend, ordinal);
-    check_cross_entropy(backend, ordinal);
     return 0;
 }

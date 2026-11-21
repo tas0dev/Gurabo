@@ -200,49 +200,13 @@ static gb_result cpu_embedding(const gb_embedding *args)
     unsigned char *out = args->out;
     const unsigned char *table = args->table;
     for (uint64_t i = 0; i < args->index_count; ++i) {
-        int64_t index = gb_read_index(args->indices, i, args->index_bytes);
+        int64_t index = gb_embedding_index(args, i);
         unsigned char *row = out + i * row_bytes;
         if (index < 0 || (uint64_t)index >= args->vocabulary) {
             memset(row, 0, row_bytes);
             invalid = 1;
         } else {
             memcpy(row, table + (uint64_t)index * row_bytes, row_bytes);
-        }
-    }
-    return gb_status(invalid ? GURABO_OUT_OF_RANGE : GURABO_OK);
-}
-
-static gb_result cpu_cross_entropy(const gb_cross_entropy *args)
-{
-    int invalid = 0;
-    for (uint64_t row = 0; row < args->rows; ++row) {
-        uint64_t start = row * args->columns;
-        int64_t target = gb_read_index(args->targets, row, args->index_bytes);
-        float maximum = gb_float_from_bits(0xFF800000u);
-        float others = 0.0f;
-        float target_term = 0.0f;
-        if (target == args->ignore_index) {
-            target = -1;
-        } else if (target < 0 || (uint64_t)target >= args->columns) {
-            invalid = 1;
-            target = -1;
-        } else {
-            for (uint64_t col = 0; col < args->columns; ++col) {
-                maximum = gb_max_float(maximum,
-                                       gb_load_float(args->logits, start + col, args->logit_dtype));
-            }
-            for (uint64_t col = 0; col < args->columns; ++col) {
-                if (col != (uint64_t)target) {
-                    others += gb_cross_entropy_term(args, start + col, maximum);
-                }
-            }
-            target_term = gb_cross_entropy_term(args, start + (uint64_t)target, maximum);
-        }
-        gb_cross_entropy_loss(args, row, target, maximum, others, target_term);
-        if (args->gradient) {
-            for (uint64_t col = 0; col < args->columns; ++col) {
-                gb_cross_entropy_grad(args, start, col, target, maximum, others, target_term);
-            }
         }
     }
     return gb_status(invalid ? GURABO_OUT_OF_RANGE : GURABO_OK);
@@ -256,9 +220,6 @@ static gb_result cpu_kernel_launch(void *stream, void *state, const gb_kernel *k
     (void)completion;
     if (kernel->kind == GB_KERNEL_EMBEDDING) {
         return cpu_embedding(&kernel->args.embedding);
-    }
-    if (kernel->kind == GB_KERNEL_CROSS_ENTROPY) {
-        return cpu_cross_entropy(&kernel->args.cross_entropy);
     }
     if (kernel->kind == GB_KERNEL_ROWWISE) {
         cpu_rowwise(&kernel->args.rowwise);
@@ -278,8 +239,7 @@ const gb_backend gb_cpu = {
                 GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL |
                 GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM |
                 GURABO_FEATURE_ACTIVATION | GURABO_FEATURE_SOFTMAX | GURABO_FEATURE_BINARY_SUB_DIV |
-                GURABO_FEATURE_EMBEDDING | GURABO_FEATURE_BATCHED_GEMM |
-                GURABO_FEATURE_CROSS_ENTROPY | GURABO_FEATURE_AXPBY,
+                GURABO_FEATURE_EMBEDDING | GURABO_FEATURE_BATCHED_GEMM | GURABO_FEATURE_AXPBY,
     .device_count = cpu_count,
     .device_info = cpu_info,
     .alloc = cpu_alloc,

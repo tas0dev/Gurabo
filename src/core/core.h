@@ -31,7 +31,7 @@ typedef struct gb_job {
     gurabo_event *recorded_event;
     gurabo_event *dependency;
     uint32_t count;
-    gurabo_buffer *buffers[4];
+    gurabo_buffer *buffers[3];
 } gb_job;
 
 struct gurabo_context {

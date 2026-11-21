@@ -41,10 +41,12 @@ typedef struct {
     gb_result (*stream_sync)(void *);
 
     /* Completion markers are absent for immediate-execution backends. */
-    gb_result (*marker_create)(void *stream, void **);
+    gb_result (*marker_create)(uint32_t ordinal, void **);
     gb_result (*marker_record)(void *stream, void *);
-    gb_result (*marker_query)(void *stream, void *);
-    gb_result (*marker_destroy)(void *stream, void *);
+    gb_result (*marker_query)(uint32_t ordinal, void *);
+    gb_result (*marker_destroy)(uint32_t ordinal, void *);
+    gb_result (*marker_sync)(uint32_t ordinal, void *);
+    gb_result (*marker_wait)(void *stream, void *);
 
     /* Host transfer must stop using the borrowed pointer before returning.
        Set unsafe if the device allocation may still be in use after failure. */

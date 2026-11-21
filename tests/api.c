@@ -169,6 +169,68 @@ static void check_layout(gurabo_context *context)
     CHECK(usage == 0);
 }
 
+static void check_events(gurabo_backend backend, uint32_t ordinal, gurabo_context *context)
+{
+    gurabo_stream *producer = NULL, *consumer = NULL, *foreign_stream = NULL;
+    gurabo_context *foreign = NULL;
+    gurabo_event *ready = NULL, *returned = NULL, *finished = NULL;
+    gurabo_buffer *input = NULL, *middle = NULL, *result = NULL;
+    const uint32_t expected = 0xC0FFEEu;
+    uint32_t actual = 0;
+
+    OK(gurabo_stream_create(context, &producer));
+    OK(gurabo_stream_create(context, &consumer));
+    OK(gurabo_context_create(backend, ordinal, &foreign));
+    OK(gurabo_stream_create(foreign, &foreign_stream));
+    OK(gurabo_event_create(context, &ready));
+    STATUS(gurabo_event_create(context, &ready), GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_event_query(ready), GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_event_synchronize(ready), GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_stream_wait_event(consumer, ready), GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_event_record(foreign_stream, ready), GURABO_CONTEXT_MISMATCH);
+    STATUS(gurabo_stream_wait_event(foreign_stream, ready), GURABO_CONTEXT_MISMATCH);
+    OK(gurabo_stream_destroy(&foreign_stream));
+    OK(gurabo_context_destroy(&foreign));
+
+    OK(gurabo_event_create(context, &returned));
+    OK(gurabo_event_create(context, &finished));
+    OK(gurabo_buffer_alloc(context, sizeof(expected), 0, &input));
+    OK(gurabo_buffer_alloc(context, sizeof(expected), 0, &middle));
+    OK(gurabo_buffer_alloc(context, sizeof(expected), 0, &result));
+    OK(gurabo_buffer_write(producer, input, 0, &expected, sizeof(expected)));
+    OK(gurabo_buffer_copy_async(producer, middle, 0, input, 0, sizeof(expected)));
+    OK(gurabo_event_record(producer, ready));
+    STATUS(gurabo_event_record(producer, ready), GURABO_INVALID_ARGUMENT);
+    OK(gurabo_stream_wait_event(consumer, ready));
+    OK(gurabo_event_release(&ready));
+    OK(gurabo_buffer_copy_async(consumer, result, 0, middle, 0, sizeof(expected)));
+    OK(gurabo_event_record(consumer, returned));
+    OK(gurabo_stream_wait_event(producer, returned));
+    OK(gurabo_event_release(&returned));
+    OK(gurabo_event_record(producer, finished));
+    OK(gurabo_buffer_release(&input));
+    OK(gurabo_buffer_release(&middle));
+
+    gurabo_status status = gurabo_event_query(finished);
+    CHECK(status == GURABO_OK || (backend == GURABO_HIP && status == GURABO_NOT_READY));
+    OK(gurabo_event_synchronize(finished));
+    OK(gurabo_buffer_read(producer, &actual, result, 0, sizeof(actual)));
+    CHECK(actual == expected);
+
+    OK(gurabo_buffer_release(&result));
+    OK(gurabo_stream_destroy(&consumer));
+    OK(gurabo_stream_destroy(&producer));
+    OK(gurabo_event_query(finished));
+    OK(gurabo_event_release(&finished));
+
+    OK(gurabo_context_create(backend, ordinal, &foreign));
+    OK(gurabo_event_create(foreign, &finished));
+    STATUS(gurabo_context_destroy(&foreign), GURABO_BUSY);
+    OK(gurabo_event_release(&finished));
+    OK(gurabo_event_release(&finished));
+    OK(gurabo_context_destroy(&foreign));
+}
+
 static void check_matmul(gurabo_context *context, gurabo_stream *stream,
                          uint32_t trans_a, uint32_t trans_b, float beta,
                          float actual[8])
@@ -270,6 +332,7 @@ int main(int argc, char **argv)
 
     check_memory(backend, ordinal, context, stream);
     check_layout(context);
+    check_events(backend, ordinal, context);
     for (uint32_t ta = 0; ta < 2; ++ta) {
         for (uint32_t tb = 0; tb < 2; ++tb) {
             for (int use_beta = 0; use_beta <= 1; ++use_beta) {

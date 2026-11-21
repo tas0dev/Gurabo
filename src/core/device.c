@@ -149,6 +149,7 @@ gurabo_status gurabo_context_destroy(gurabo_context **context)
         gb_unlock(&value->gate);
         return gb_fail(GURABO_BUSY, value->backend->id);
     }
+    gb_buffer_collect(value);
     gurabo_error_info error = value->error;
     gb_unlock(&value->gate);
     gb_mutex_destroy(&value->gate);
@@ -192,6 +193,7 @@ gurabo_status gurabo_context_synchronize(gurabo_context *context)
         int completed;
         gb_stream_sync_locked(stream, &completed);
     }
+    gb_buffer_collect(context);
     gurabo_status status = context->error.status != GURABO_OK ? gb_report(&context->error)
                                                             : GURABO_OK;
     if (status == GURABO_OK && context->lost) {

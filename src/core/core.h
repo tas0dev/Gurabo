@@ -24,6 +24,10 @@ static inline void gb_unlock(gb_mutex *m) { pthread_mutex_unlock(m); }
 typedef struct gb_job {
     struct gb_job *next;
     void *marker;
+    uint64_t id;
+    int marker_recorded;
+    gurabo_event *recorded_event;
+    gurabo_event *dependency;
     uint32_t count;
     gurabo_buffer *buffers[3];
 } gb_job;
@@ -33,6 +37,7 @@ struct gurabo_context {
     uint32_t ordinal;
     gb_mutex gate;
     gurabo_stream *streams;
+    gurabo_buffer *retired_buffers;
     uint64_t children;
     uint64_t allocated_bytes;
     uint64_t last_submission;
@@ -48,10 +53,24 @@ struct gurabo_stream {
     gb_job *tail;
     gurabo_buffer *faulted_transfer;
     gurabo_error_info error;
+    gurabo_error_info execution_error;
+    uint64_t execution_error_at;
+};
+
+struct gurabo_event {
+    gurabo_context *context;
+    gurabo_stream *source;
+    void *marker;
+    uint64_t references;
+    uint64_t submission_id;
+    gurabo_error_info error;
+    int resolved;
+    int quarantined;
 };
 
 struct gurabo_buffer {
     gurabo_context *context;
+    gurabo_buffer *next_retired;
     gb_allocation allocation;
     uint64_t bytes;
     uint64_t references;
@@ -82,6 +101,8 @@ void gb_stream_reap(gurabo_stream *);
 gurabo_status gb_job_begin(gurabo_stream *, gb_job **out);
 void gb_job_end(gurabo_stream *, gb_job *, gurabo_buffer *const *, uint32_t, gb_result);
 gb_result gb_buffer_unref(gurabo_buffer *);
+void gb_buffer_unref_deferred(gurabo_buffer *);
+void gb_buffer_collect(gurabo_context *);
 
 static inline void *gb_buffer_address(const gurabo_buffer *buffer, uint64_t offset)
 {

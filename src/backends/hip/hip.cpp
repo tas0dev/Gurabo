@@ -190,10 +190,9 @@ gb_result stream_sync(void *stream)
     return hip_result(hipStreamSynchronize(native->stream));
 }
 
-gb_result marker_create(void *stream, void **out)
+gb_result marker_create(uint32_t ordinal, void **out)
 {
-    auto *native = static_cast<hip_stream *>(stream);
-    device_scope device(native->ordinal);
+    device_scope device(ordinal);
     if (device.error != hipSuccess) {
         return hip_result(device.error);
     }
@@ -214,20 +213,34 @@ gb_result marker_record(void *stream, void *marker)
                       : device.error);
 }
 
-gb_result marker_query(void *stream, void *marker)
+gb_result marker_query(uint32_t ordinal, void *marker)
 {
-    auto *native = static_cast<hip_stream *>(stream);
-    device_scope device(native->ordinal);
+    device_scope device(ordinal);
     return hip_result(device.error == hipSuccess
                       ? hipEventQuery(static_cast<hipEvent_t>(marker)) : device.error);
 }
 
-gb_result marker_destroy(void *stream, void *marker)
+gb_result marker_destroy(uint32_t ordinal, void *marker)
+{
+    device_scope device(ordinal);
+    return hip_result(device.error == hipSuccess
+                      ? hipEventDestroy(static_cast<hipEvent_t>(marker)) : device.error);
+}
+
+gb_result marker_sync(uint32_t ordinal, void *marker)
+{
+    device_scope device(ordinal);
+    return hip_result(device.error == hipSuccess
+                      ? hipEventSynchronize(static_cast<hipEvent_t>(marker)) : device.error);
+}
+
+gb_result marker_wait(void *stream, void *marker)
 {
     auto *native = static_cast<hip_stream *>(stream);
     device_scope device(native->ordinal);
     return hip_result(device.error == hipSuccess
-                      ? hipEventDestroy(static_cast<hipEvent_t>(marker)) : device.error);
+                      ? hipStreamWaitEvent(native->stream, static_cast<hipEvent_t>(marker), 0)
+                      : device.error);
 }
 
 gb_result transfer(void *stream, void *dst, const void *src, size_t bytes,
@@ -320,6 +333,8 @@ const gb_backend gb_hip = {
     marker_record,
     marker_query,
     marker_destroy,
+    marker_sync,
+    marker_wait,
     transfer,
     copy,
     matmul

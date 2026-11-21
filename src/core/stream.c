@@ -1,54 +1,146 @@
 #include "core.h"
 
+static void remember_error(gurabo_stream *stream, const gurabo_error_info *error,
+                           uint64_t position)
+{
+    if (stream->error.status == GURABO_OK && error->phase != GURABO_ERROR_CALL) {
+        stream->error = *error;
+    }
+    if (error->phase == GURABO_ERROR_EXECUTION && position &&
+        (!stream->execution_error_at || position < stream->execution_error_at)) {
+        stream->execution_error_at = position;
+        stream->execution_error = *error;
+    }
+    gb_context_error(stream->context, error);
+}
+
 static void remember(gurabo_stream *stream, gb_result result, gurabo_error_phase phase,
                      uint64_t submission)
 {
-    if (result.status == GURABO_OK) {
-        return;
+    if (result.status != GURABO_OK) {
+        gurabo_error_info error = gb_make_error(result, stream->context->backend->id,
+                                               phase, submission);
+        uint64_t position = submission;
+        if (!position && stream->head) {
+            position = stream->head->id;
+        }
+        remember_error(stream, &error, position);
     }
-    gurabo_context *context = stream->context;
-    gurabo_error_info error = gb_make_error(result, context->backend->id, phase, submission);
-    if (stream->error.status == GURABO_OK && phase != GURABO_ERROR_CALL) {
-        stream->error = error;
-    }
-    gb_context_error(context, &error);
 }
 
-static void retire_job(gurabo_stream *stream, int safe)
+static void event_observe_error(gurabo_event *event)
+{
+    gurabo_stream *source = event->source;
+    if (!event->resolved && source && source->execution_error_at &&
+        source->execution_error_at <= event->submission_id) {
+        event->error = source->execution_error;
+        event->resolved = 1;
+    }
+}
+
+static gb_result event_unref(gurabo_event *event, int safe)
+{
+    if (!safe) {
+        event->quarantined = 1;
+    }
+    gb_result result = gb_status(GURABO_OK);
+    if (--event->references == 0) {
+        gurabo_context *context = event->context;
+        if (event->submission_id && context->backend->marker_destroy && !event->quarantined) {
+            result = context->backend->marker_destroy(context->ordinal, event->marker);
+        }
+        free(event);
+    }
+    return result;
+}
+
+static void remember_dependency(gurabo_stream *stream, const gurabo_error_info *error,
+                                uint64_t submission)
+{
+    if (error->status != GURABO_OK) {
+        gurabo_error_info propagated = *error;
+        propagated.submission_id = submission;
+        remember_error(stream, &propagated, submission);
+    }
+}
+
+static void retire_job(gurabo_stream *stream, int safe, int defer_buffer_free)
 {
     gb_job *job = stream->head;
     stream->head = job->next;
     if (!stream->head) {
         stream->tail = NULL;
     }
-    if (safe) {
-        gb_result result = stream->context->backend->marker_destroy(stream->native, job->marker);
+    gurabo_context *context = stream->context;
+    if (job->dependency) {
+        gurabo_event *dependency = job->dependency;
+        if (safe) {
+            remember_dependency(stream, &dependency->error, job->id);
+        }
+        remember(stream, event_unref(dependency, safe), GURABO_ERROR_CLEANUP, 0);
+    }
+    if (job->recorded_event) {
+        gurabo_event *event = job->recorded_event;
+        event_observe_error(event);
+        event->resolved = 1;
+        event->source = NULL;
+        remember(stream, event_unref(event, safe), GURABO_ERROR_CLEANUP, 0);
+    } else if (safe) {
+        gb_result result = context->backend->marker_destroy(context->ordinal, job->marker);
         remember(stream, result, GURABO_ERROR_CLEANUP, 0);
     }
     for (uint32_t i = 0; i < job->count; ++i) {
         if (!safe) {
             job->buffers[i]->quarantined = 1;
         }
-        gb_result result = gb_buffer_unref(job->buffers[i]);
-        remember(stream, result, GURABO_ERROR_CLEANUP, 0);
+        if (defer_buffer_free) {
+            /* A native buffer free can synchronize unrelated device work. */
+            gb_buffer_unref_deferred(job->buffers[i]);
+        } else {
+            gb_result result = gb_buffer_unref(job->buffers[i]);
+            remember(stream, result, GURABO_ERROR_CLEANUP, 0);
+        }
     }
     free(job);
 }
 
-void gb_stream_reap(gurabo_stream *stream)
+static void reap_through(gurabo_stream *stream, uint64_t limit)
 {
-    const gb_backend *backend = stream->context->backend;
-    while (stream->head && stream->error.status == GURABO_OK && !stream->context->lost) {
-        gb_result result = backend->marker_query(stream->native, stream->head->marker);
+    gurabo_context *context = stream->context;
+    while (stream->head && stream->head->id <= limit) {
+        gurabo_stream *current = stream;
+        /* Dependencies always refer to earlier submissions. Walk the chain
+           iteratively so its length does not consume the C stack. */
+        while (current->head->dependency) {
+            gurabo_event *dependency = current->head->dependency;
+            event_observe_error(dependency);
+            if (dependency->resolved) {
+                break;
+            }
+            current = dependency->source;
+        }
+        gb_job *job = current->head;
+        if (!job->marker_recorded) {
+            return;
+        }
+        gb_result result = context->backend->marker_query(context->ordinal, job->marker);
         if (result.status == GURABO_NOT_READY) {
             break;
         }
         if (result.status != GURABO_OK) {
-            remember(stream, result, GURABO_ERROR_EXECUTION, 0);
-            break;
+            remember(current, result, GURABO_ERROR_EXECUTION, 0);
+            if (current == stream) {
+                break;
+            }
+            continue;
         }
-        retire_job(stream, 1);
+        retire_job(current, 1, 1);
     }
+}
+
+void gb_stream_reap(gurabo_stream *stream)
+{
+    reap_through(stream, UINT64_MAX);
 }
 
 gurabo_status gb_stream_ready(gurabo_stream *stream)
@@ -75,7 +167,7 @@ gurabo_status gb_job_begin(gurabo_stream *stream, gb_job **out)
     if (!job) {
         return gb_fail(GURABO_OUT_OF_MEMORY, context->backend->id);
     }
-    gb_result result = context->backend->marker_create(stream->native, &job->marker);
+    gb_result result = context->backend->marker_create(context->ordinal, &job->marker);
     if (result.status != GURABO_OK) {
         free(job);
         remember(stream, result, GURABO_ERROR_CALL, 0);
@@ -94,6 +186,7 @@ void gb_job_end(gurabo_stream *stream, gb_job *job, gurabo_buffer *const *buffer
     if (!job) {
         return;
     }
+    job->id = id;
 
     /* Native submission may have queued work even when it reports an error. */
     for (uint32_t i = 0; i < count; ++i) {
@@ -108,7 +201,29 @@ void gb_job_end(gurabo_stream *stream, gb_job *job, gurabo_buffer *const *buffer
     }
     stream->tail = job;
     result = context->backend->marker_record(stream->native, job->marker);
-    remember(stream, result, GURABO_ERROR_EXECUTION, 0);
+    job->marker_recorded = result.status == GURABO_OK;
+    remember(stream, result, GURABO_ERROR_EXECUTION, id);
+}
+
+/* The caller proved that the native Stream finished through limit. The
+   dependency's result still has to be observed on its recording Stream. */
+static void retire_completed_through(gurabo_stream *stream, uint64_t limit,
+                                     int defer_buffer_free)
+{
+    while (stream->head && stream->head->id <= limit) {
+        gb_job *job = stream->head;
+        gurabo_event *dependency = job->dependency;
+        if (dependency && !dependency->resolved) {
+            reap_through(dependency->source, dependency->submission_id);
+            event_observe_error(dependency);
+            if (!dependency->resolved) {
+                gb_result result = {GURABO_BACKEND_ERROR, GURABO_NATIVE_GURABO, 0,
+                                    "stream completed before its event dependency"};
+                remember(stream, result, GURABO_ERROR_EXECUTION, job->id);
+            }
+        }
+        retire_job(stream, 1, defer_buffer_free);
+    }
 }
 
 static void retire_transfer(gurabo_stream *stream, int safe)
@@ -131,9 +246,7 @@ gurabo_status gb_stream_sync_locked(gurabo_stream *stream, int *completed)
     remember(stream, result, GURABO_ERROR_EXECUTION, 0);
     if (*completed) {
         retire_transfer(stream, 1);
-        while (stream->head) {
-            retire_job(stream, 1);
-        }
+        retire_completed_through(stream, UINT64_MAX, 0);
     }
     return stream->error.status == GURABO_OK ? GURABO_OK : gb_report(&stream->error);
 }
@@ -218,7 +331,7 @@ gurabo_status gurabo_stream_destroy(gurabo_stream **stream)
         /* Without a completion proof, native handles and storage cannot be reused. */
         retire_transfer(value, 0);
         while (value->head) {
-            retire_job(value, 0);
+            retire_job(value, 0, 0);
         }
     }
     gurabo_stream **link = &context->streams;
@@ -230,6 +343,177 @@ gurabo_status gurabo_stream_destroy(gurabo_stream **stream)
     gurabo_status status = value->error.status == GURABO_OK ? GURABO_OK : gb_report(&value->error);
     free(value);
     *stream = NULL;
+    gb_unlock(&context->gate);
+    return status;
+}
+
+gurabo_status gurabo_event_create(gurabo_context *context, gurabo_event **out)
+{
+    if (!context) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_backend id = context->backend->id;
+    if (!out || *out) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    gb_lock(&context->gate);
+    if (context->lost) {
+        gb_unlock(&context->gate);
+        return gb_fail(GURABO_DEVICE_LOST, id);
+    }
+    gurabo_event *event = calloc(1, sizeof(*event));
+    if (!event) {
+        gb_unlock(&context->gate);
+        return gb_fail(GURABO_OUT_OF_MEMORY, id);
+    }
+    event->context = context;
+    event->references = 1;
+    ++context->children;
+    *out = event;
+    gb_unlock(&context->gate);
+    return GURABO_OK;
+}
+
+gurabo_status gurabo_event_record(gurabo_stream *stream, gurabo_event *event)
+{
+    if (!stream || !event) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = stream->context;
+    gurabo_backend id = context->backend->id;
+    if (event->context != context) {
+        return gb_fail(GURABO_CONTEXT_MISMATCH, id);
+    }
+    gb_lock(&context->gate);
+    if (event->submission_id) {
+        gb_unlock(&context->gate);
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    gurabo_status status = gb_stream_ready(stream);
+    gb_job *job = NULL;
+    if (status == GURABO_OK) {
+        status = gb_job_begin(stream, &job);
+    }
+    if (status == GURABO_OK) {
+        event->submission_id = context->last_submission + 1;
+        if (job) {
+            event->source = stream;
+            event->marker = job->marker;
+            ++event->references;
+            job->recorded_event = event;
+        } else {
+            event->resolved = 1;
+        }
+        gb_job_end(stream, job, NULL, 0, gb_status(GURABO_OK));
+    }
+    gb_unlock(&context->gate);
+    return status;
+}
+
+static gurabo_status event_completion(gurabo_event *event, int wait)
+{
+    if (!event) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = event->context;
+    gb_lock(&context->gate);
+    if (!event->submission_id) {
+        gb_unlock(&context->gate);
+        return gb_fail(GURABO_INVALID_ARGUMENT, context->backend->id);
+    }
+    event_observe_error(event);
+    if (!event->resolved && wait) {
+        gurabo_stream *source = event->source;
+        gb_result result = context->backend->marker_sync(context->ordinal, event->marker);
+        if (result.status == GURABO_OK) {
+            retire_completed_through(source, event->submission_id, 1);
+        } else {
+            remember(source, result, GURABO_ERROR_EXECUTION, 0);
+            event_observe_error(event);
+        }
+    } else if (!event->resolved) {
+        reap_through(event->source, event->submission_id);
+        event_observe_error(event);
+    }
+    gurabo_status status = GURABO_NOT_READY;
+    if (event->resolved) {
+        status = event->error.status == GURABO_OK ? GURABO_OK : gb_report(&event->error);
+    }
+    gb_unlock(&context->gate);
+    return status;
+}
+
+gurabo_status gurabo_event_query(const gurabo_event *event)
+{
+    return event_completion((gurabo_event *)event, 0);
+}
+
+gurabo_status gurabo_event_synchronize(const gurabo_event *event)
+{
+    return event_completion((gurabo_event *)event, 1);
+}
+
+gurabo_status gurabo_stream_wait_event(gurabo_stream *stream, const gurabo_event *event)
+{
+    if (!stream || !event) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = stream->context;
+    gurabo_backend id = context->backend->id;
+    if (event->context != context) {
+        return gb_fail(GURABO_CONTEXT_MISMATCH, id);
+    }
+    gb_lock(&context->gate);
+    if (!event->submission_id) {
+        gb_unlock(&context->gate);
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    gurabo_status status = gb_stream_ready(stream);
+    gb_job *job = NULL;
+    if (status == GURABO_OK) {
+        status = gb_job_begin(stream, &job);
+    }
+    if (status == GURABO_OK) {
+        gurabo_event *dependency = (gurabo_event *)event;
+        event_observe_error(dependency);
+        gb_result result = gb_status(GURABO_OK);
+        if (job) {
+            ++dependency->references;
+            job->dependency = dependency;
+            if (event->error.status == GURABO_OK) {
+                result = context->backend->marker_wait(stream->native, event->marker);
+            }
+        }
+        if (event->error.status != GURABO_OK) {
+            remember_dependency(stream, &event->error, context->last_submission + 1);
+        }
+        gb_job_end(stream, job, NULL, 0, result);
+    }
+    gb_unlock(&context->gate);
+    return status;
+}
+
+gurabo_status gurabo_event_release(gurabo_event **event)
+{
+    if (!event) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, 0);
+    }
+    gurabo_event *value = *event;
+    if (!value) {
+        return GURABO_OK;
+    }
+    gurabo_context *context = value->context;
+    gb_lock(&context->gate);
+    --context->children;
+    *event = NULL;
+    gb_result result = event_unref(value, 1);
+    gurabo_status status = GURABO_OK;
+    if (result.status != GURABO_OK) {
+        gurabo_error_info error = gb_make_error(result, context->backend->id,
+                                                GURABO_ERROR_CLEANUP, 0);
+        gb_context_error(context, &error);
+        status = gb_report(&error);
+    }
     gb_unlock(&context->gate);
     return status;
 }

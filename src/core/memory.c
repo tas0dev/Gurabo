@@ -24,6 +24,7 @@ gurabo_status gurabo_buffer_alloc(gurabo_context *context, uint64_t bytes,
     for (gurabo_stream *stream = context->streams; stream; stream = stream->next) {
         gb_stream_reap(stream);
     }
+    gb_buffer_collect(context);
     if (context->lost || bytes > UINT64_MAX - context->allocated_bytes) {
         gurabo_status status = context->lost ? GURABO_DEVICE_LOST : GURABO_OUT_OF_RANGE;
         gb_unlock(&context->gate);
@@ -52,24 +53,45 @@ gurabo_status gurabo_buffer_alloc(gurabo_context *context, uint64_t bytes,
     return gb_call_result(result, backend->id);
 }
 
-gb_result gb_buffer_unref(gurabo_buffer *buffer)
+static gb_result free_buffer(gurabo_buffer *buffer)
 {
     gb_result result = gb_status(GURABO_OK);
+    gurabo_context *context = buffer->context;
+    if (!buffer->quarantined) {
+        result = context->backend->free(context->ordinal, buffer->allocation);
+        if (result.status == GURABO_OK) {
+            context->allocated_bytes -= buffer->bytes;
+        } else {
+            gurabo_error_info error = gb_make_error(result, context->backend->id,
+                                                    GURABO_ERROR_CLEANUP, 0);
+            gb_context_error(context, &error);
+        }
+    }
+    free(buffer);
+    return result;
+}
+
+gb_result gb_buffer_unref(gurabo_buffer *buffer)
+{
+    return --buffer->references == 0 ? free_buffer(buffer) : gb_status(GURABO_OK);
+}
+
+void gb_buffer_unref_deferred(gurabo_buffer *buffer)
+{
     if (--buffer->references == 0) {
         gurabo_context *context = buffer->context;
-        if (!buffer->quarantined) {
-            result = context->backend->free(context->ordinal, buffer->allocation);
-            if (result.status == GURABO_OK) {
-                context->allocated_bytes -= buffer->bytes;
-            } else {
-                gurabo_error_info error = gb_make_error(result, context->backend->id,
-                                                        GURABO_ERROR_CLEANUP, 0);
-                gb_context_error(context, &error);
-            }
-        }
-        free(buffer);
+        buffer->next_retired = context->retired_buffers;
+        context->retired_buffers = buffer;
     }
-    return result;
+}
+
+void gb_buffer_collect(gurabo_context *context)
+{
+    while (context->retired_buffers) {
+        gurabo_buffer *buffer = context->retired_buffers;
+        context->retired_buffers = buffer->next_retired;
+        free_buffer(buffer);
+    }
 }
 
 gurabo_status gurabo_buffer_release(gurabo_buffer **buffer)
@@ -216,6 +238,7 @@ gurabo_status gurabo_context_memory_usage(gurabo_context *context, uint64_t *all
     for (gurabo_stream *stream = context->streams; stream; stream = stream->next) {
         gb_stream_reap(stream);
     }
+    gb_buffer_collect(context);
     *allocated_bytes = context->allocated_bytes;
     gb_unlock(&context->gate);
     return GURABO_OK;

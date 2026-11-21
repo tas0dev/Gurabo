@@ -84,6 +84,7 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     CHECK(caps.feature_mask & GURABO_FEATURE_BINARY_SUB_DIV);
     CHECK(caps.feature_mask & GURABO_FEATURE_BATCHED_GEMM);
     CHECK(caps.feature_mask & GURABO_FEATURE_CROSS_ENTROPY);
+    CHECK(caps.feature_mask & GURABO_FEATURE_AXPBY);
     CHECK(!!(caps.feature_mask & GURABO_FEATURE_PINNED_HOST_MEMORY) == (backend == GURABO_HIP));
     CHECK(caps.max_tensor_rank == GURABO_MAX_RANK && caps.min_buffer_alignment >= sizeof(float));
 
@@ -763,6 +764,47 @@ static void check_embedding_failure(gurabo_backend backend, uint32_t ordinal)
     STATUS(gurabo_context_destroy(&context), GURABO_OUT_OF_RANGE);
 }
 
+static void check_gradient_accumulation(gurabo_context *context, gurabo_stream *stream)
+{
+    struct accumulation_storage {
+        float gradient[3];
+        uint16_t microbatch_a[3], microbatch_b[3];
+    };
+    const struct accumulation_storage initial = {
+        {NAN, NAN, NAN},
+        {0x4000, 0xC400, 0x4600}, /* F16: 2, -4, 6 */
+        {0x4080, 0x4100, 0xC080}  /* BF16: 4, 8, -4 */
+    };
+    gurabo_buffer *buffer = NULL;
+    gurabo_tensor *gradient = NULL, *a = NULL, *b = NULL, *overlap = NULL;
+    OK(gurabo_buffer_alloc(context, sizeof(initial), 0, &buffer));
+    OK(gurabo_buffer_write(stream, buffer, 0, &initial, sizeof(initial)));
+    gurabo_tensor_desc shape = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = GURABO_F32,
+                                .rank = 1, .extent = {3}};
+    OK(gurabo_tensor_create(buffer, 0, &shape, &gradient));
+    OK(gurabo_tensor_create(buffer, sizeof(float), &shape, &overlap));
+    shape.dtype = GURABO_F16;
+    OK(gurabo_tensor_create(buffer, offsetof(struct accumulation_storage, microbatch_a), &shape, &a));
+    shape.dtype = GURABO_BF16;
+    OK(gurabo_tensor_create(buffer, offsetof(struct accumulation_storage, microbatch_b), &shape, &b));
+    STATUS(gurabo_axpby_async(stream, gradient, overlap, 1, 0), GURABO_INVALID_ARGUMENT);
+    STATUS(gurabo_axpby_async(stream, gradient, a, NAN, 0), GURABO_INVALID_ARGUMENT);
+    OK(gurabo_axpby_async(stream, gradient, a, 0.5f, 0));
+    OK(gurabo_axpby_async(stream, gradient, b, 0.5f, 1));
+    OK(gurabo_axpby_async(stream, gradient, gradient, 0, 0.5f));
+    float actual[3];
+    OK(gurabo_buffer_read(stream, actual, buffer, 0, sizeof(actual)));
+    CHECK(actual[0] == 1.5f && actual[1] == 1.0f && actual[2] == 0.5f);
+    OK(gurabo_axpby_async(stream, gradient, gradient, 0, 0));
+    OK(gurabo_buffer_read(stream, actual, buffer, 0, sizeof(actual)));
+    CHECK(actual[0] == 0 && actual[1] == 0 && actual[2] == 0);
+    OK(gurabo_tensor_release(&overlap));
+    OK(gurabo_tensor_release(&b));
+    OK(gurabo_tensor_release(&a));
+    OK(gurabo_tensor_release(&gradient));
+    OK(gurabo_buffer_release(&buffer));
+}
+
 static void check_language_model_training(gurabo_context *context, gurabo_stream *stream,
                                           gurabo_dtype dtype)
 {
@@ -1115,6 +1157,7 @@ int main(int argc, char **argv)
     check_empty_reduction(context, stream);
     check_rms_chain(context, stream);
     check_softmax_activation(context, stream);
+    check_gradient_accumulation(context, stream);
     check_language_model_training(context, stream, GURABO_F16);
     check_language_model_training(context, stream, GURABO_BF16);
     check_float16_conversion();

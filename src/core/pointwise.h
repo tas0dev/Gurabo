@@ -11,6 +11,7 @@
 #define GB_POINTWISE_SILU 5u
 #define GB_POINTWISE_RELU 6u
 #define GB_POINTWISE_GELU 7u
+#define GB_POINTWISE_AXPBY 8u
 #define GB_POINTWISE_F32 1u
 #define GB_POINTWISE_F16 2u
 #define GB_POINTWISE_BF16 3u
@@ -34,6 +35,8 @@ typedef struct {
     uint32_t op;
     uint32_t input_dtype;
     uint32_t output_dtype;
+    float alpha;
+    float beta;
 } gb_pointwise;
 
 typedef struct {
@@ -294,6 +297,14 @@ GB_KERNEL_INLINE float gb_pointwise_value(const gb_pointwise *args, uint32_t a_b
 
 GB_KERNEL_INLINE void gb_pointwise_apply(const gb_pointwise *args, uint64_t index)
 {
+    if (args->op == GB_POINTWISE_AXPBY) {
+        float input = args->alpha != 0.0f
+                    ? args->alpha * gb_load_float(args->a, index, args->input_dtype) : 0.0f;
+        float previous = args->beta != 0.0f
+                       ? args->beta * gb_load_float(args->out, index, GB_POINTWISE_F32) : 0.0f;
+        gb_store_float(args->out, index, GB_POINTWISE_F32, input + previous);
+        return;
+    }
     uint64_t a_index, b_index;
     gb_pointwise_offsets(args, index, &a_index, &b_index);
     uint32_t result = gb_pointwise_load(args->a, a_index, args->input_dtype);

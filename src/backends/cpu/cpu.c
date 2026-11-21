@@ -279,7 +279,7 @@ const gb_backend gb_cpu = {
                 GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM |
                 GURABO_FEATURE_ACTIVATION | GURABO_FEATURE_SOFTMAX | GURABO_FEATURE_BINARY_SUB_DIV |
                 GURABO_FEATURE_EMBEDDING | GURABO_FEATURE_BATCHED_GEMM |
-                GURABO_FEATURE_CROSS_ENTROPY,
+                GURABO_FEATURE_CROSS_ENTROPY | GURABO_FEATURE_AXPBY,
     .device_count = cpu_count,
     .device_info = cpu_info,
     .alloc = cpu_alloc,

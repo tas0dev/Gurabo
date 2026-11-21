@@ -106,6 +106,13 @@ gurabo_status gurabo_cross_entropy_async(gurabo_stream *stream, gurabo_tensor *l
                                          const gurabo_tensor *targets, int64_t ignore_index,
                                          float gradient_scale);
 
+/* Compute out = alpha * input + beta * out in F32. Input may use F32, F16 or
+   BF16 storage. Both tensors have the same shape and contiguous storage.
+   A zero coefficient skips the corresponding read. Coefficients are
+   finite. The ranges are disjoint or have identical F32 element mapping. */
+gurabo_status gurabo_axpby_async(gurabo_stream *stream, gurabo_tensor *out,
+                                 const gurabo_tensor *input, float alpha, float beta);
+
 #ifdef __cplusplus
 }
 #endif

@@ -427,3 +427,28 @@ gurabo_status gurabo_cross_entropy_async(gurabo_stream *stream, gurabo_tensor *l
     }};
     return submit(stream, loss, logits, targets, dlogits, &kernel);
 }
+
+gurabo_status gurabo_axpby_async(gurabo_stream *stream, gurabo_tensor *out,
+                                 const gurabo_tensor *input, float alpha, float beta)
+{
+    if (!stream || !out || !input) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = stream->context;
+    gurabo_backend id = context->backend->id;
+    if (out->buffer->context != context || input->buffer->context != context) {
+        return gb_fail(GURABO_CONTEXT_MISMATCH, id);
+    }
+    if (!shape_equal(&out->desc, &input->desc) || !isfinite(alpha) || !isfinite(beta) ||
+        (overlaps(out, input) && (out->offset != input->offset || input->desc.dtype != GURABO_F32))) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    if (out->desc.dtype != GURABO_F32 || !gb_floating_dtype(input->desc.dtype) ||
+        !out->contiguous || !input->contiguous) {
+        return gb_fail(GURABO_UNSUPPORTED, id);
+    }
+    gb_kernel kernel = {.kind = GB_KERNEL_POINTWISE, .args.pointwise = {
+        .op = GB_POINTWISE_AXPBY, .alpha = alpha, .beta = beta
+    }};
+    return submit_pointwise(stream, out, input, NULL, &kernel);
+}

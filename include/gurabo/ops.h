@@ -38,6 +38,14 @@ gurabo_status gurabo_gemm_async(gurabo_stream *stream, gurabo_tensor *out,
 gurabo_status gurabo_tensor_cast_async(gurabo_stream *stream, gurabo_tensor *out,
                                        const gurabo_tensor *input);
 
+/* Copy elements in logical row-major order without changing their bits.
+   Tensors must match in shape and dtype and belong to the Stream Context.
+   The input may be strided. The output must be contiguous.
+   Empty tensors and identical contiguous views are no-ops. Other
+   overlapping byte spans are rejected, including gaps in strided inputs. */
+gurabo_status gurabo_tensor_copy_async(gurabo_stream *stream, gurabo_tensor *out,
+                                       const gurabo_tensor *input);
+
 typedef uint32_t gurabo_binary_op;
 enum { GURABO_ADD = 1, GURABO_MUL = 2, GURABO_SUB = 3, GURABO_DIV = 4 };
 

@@ -12,6 +12,7 @@
 #define GB_POINTWISE_RELU 6u
 #define GB_POINTWISE_GELU 7u
 #define GB_POINTWISE_AXPBY 8u
+#define GB_POINTWISE_COPY_BITS 9u
 #define GB_POINTWISE_F32 1u
 #define GB_POINTWISE_F16 2u
 #define GB_POINTWISE_BF16 3u
@@ -37,6 +38,7 @@ typedef struct {
     uint32_t output_dtype;
     float alpha;
     float beta;
+    uint32_t element_bytes;
 } gb_pointwise;
 
 typedef struct {
@@ -243,6 +245,20 @@ GB_KERNEL_INLINE float gb_pointwise_value(const gb_pointwise *args, uint32_t a_b
     }
 }
 
+GB_KERNEL_INLINE void gb_copy_element(const gb_pointwise *args, uint64_t dst_index, uint64_t src_index)
+{
+    uint32_t bytes = args->element_bytes;
+    unsigned char *dst = (unsigned char *)args->out + dst_index * bytes;
+    const unsigned char *src = (const unsigned char *)args->a + src_index * bytes;
+    /* Fixed widths let HIP emit inline loads and stores. */
+    switch (bytes) {
+    case 1: *dst = *src; break;
+    case 2: GB_KERNEL_MEMCPY(dst, src, 2); break;
+    case 4: GB_KERNEL_MEMCPY(dst, src, 4); break;
+    case 8: GB_KERNEL_MEMCPY(dst, src, 8); break;
+    }
+}
+
 GB_KERNEL_INLINE void gb_pointwise_apply(const gb_pointwise *args, uint64_t index)
 {
     if (args->op == GB_POINTWISE_AXPBY) {
@@ -255,6 +271,10 @@ GB_KERNEL_INLINE void gb_pointwise_apply(const gb_pointwise *args, uint64_t inde
     }
     uint64_t a_index, b_index;
     gb_pointwise_offsets(args, index, &a_index, &b_index);
+    if (args->op == GB_POINTWISE_COPY_BITS) {
+        gb_copy_element(args, index, a_index);
+        return;
+    }
     uint32_t result = gb_pointwise_load(args->a, a_index, args->input_dtype);
     if (args->op != GB_POINTWISE_CAST) {
         float value = gb_pointwise_value(args, result, b_index);

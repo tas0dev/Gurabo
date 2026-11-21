@@ -83,6 +83,7 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     CHECK(caps.feature_mask & GURABO_FEATURE_BINARY_SUB_DIV);
     CHECK(caps.feature_mask & GURABO_FEATURE_BATCHED_GEMM);
     CHECK(caps.feature_mask & GURABO_FEATURE_AXPBY);
+    CHECK(caps.feature_mask & GURABO_FEATURE_TENSOR_COPY);
     CHECK(!!(caps.feature_mask & GURABO_FEATURE_PINNED_HOST_MEMORY) == (backend == GURABO_HIP));
     CHECK(caps.max_tensor_rank == GURABO_MAX_RANK && caps.min_buffer_alignment >= sizeof(float));
 
@@ -762,6 +763,92 @@ static void check_embedding_failure(gurabo_backend backend, uint32_t ordinal)
     STATUS(gurabo_context_destroy(&context), GURABO_OUT_OF_RANGE);
 }
 
+static void check_tensor_copy_bits(gurabo_context *context, gurabo_stream *stream)
+{
+    static const struct {
+        gurabo_dtype dtype;
+        size_t bytes;
+    } formats[] = {
+        {GURABO_U8, 1}, {GURABO_F16, 2}, {GURABO_BF16, 2},
+        {GURABO_F32, 4}, {GURABO_I32, 4}, {GURABO_I64, 8}
+    };
+    unsigned char original[32], actual[16];
+    for (size_t i = 0; i < sizeof(original); ++i) {
+        original[i] = (unsigned char)(0x80 + i);
+    }
+    gurabo_buffer *buffer = NULL;
+    OK(gurabo_buffer_alloc(context, 64, 0, &buffer));
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); ++i) {
+        size_t bytes = formats[i].bytes;
+        gurabo_tensor_desc shape = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = formats[i].dtype,
+                                    .rank = 1, .flags = GURABO_TENSOR_EXPLICIT_STRIDES,
+                                    .extent = {2}, .stride = {2}};
+        gurabo_tensor *strided = NULL, *out = NULL, *clone = NULL, *overlap = NULL;
+        OK(gurabo_tensor_create(buffer, bytes, &shape, &strided));
+        shape.flags = 0;
+        OK(gurabo_tensor_create(buffer, 32, &shape, &out));
+        OK(gurabo_tensor_create(buffer, 48, &shape, &clone));
+        OK(gurabo_tensor_create(buffer, 2 * bytes, &shape, &overlap));
+        OK(gurabo_buffer_write(stream, buffer, 0, original, sizeof(original)));
+        STATUS(gurabo_tensor_copy_async(stream, overlap, strided), GURABO_INVALID_ARGUMENT);
+        STATUS(gurabo_tensor_copy_async(stream, strided, out), GURABO_UNSUPPORTED);
+        OK(gurabo_tensor_copy_async(stream, out, strided));
+        OK(gurabo_tensor_copy_async(stream, out, out));
+        OK(gurabo_tensor_copy_async(stream, clone, out));
+        OK(gurabo_buffer_read(stream, actual, buffer, 48, 2 * bytes));
+        CHECK(memcmp(actual, original + bytes, bytes) == 0);
+        CHECK(memcmp(actual + bytes, original + 3 * bytes, bytes) == 0);
+        OK(gurabo_tensor_release(&overlap));
+        OK(gurabo_tensor_release(&clone));
+        OK(gurabo_tensor_release(&out));
+        OK(gurabo_tensor_release(&strided));
+    }
+    OK(gurabo_buffer_release(&buffer));
+}
+
+static void check_tensor_copy_gemm(gurabo_context *context, gurabo_stream *stream)
+{
+    const struct source_storage {
+        float transposed[6];
+        float padded[12];
+    } original = {{1, 4, 2, 5, 3, 6}, {0, 7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12}};
+    gurabo_buffer *source = NULL, *packed = NULL;
+    gurabo_tensor *transposed = NULL, *sliced = NULL, *left = NULL, *right = NULL, *result = NULL;
+    const size_t right_offset = sizeof(original.transposed);
+    const size_t output_offset = 2 * right_offset;
+    float actual[4];
+    const float expected[] = {58, 64, 139, 154};
+    OK(gurabo_buffer_alloc(context, sizeof(original), 0, &source));
+    OK(gurabo_buffer_alloc(context, output_offset + sizeof(actual), 0, &packed));
+    OK(gurabo_buffer_write(stream, source, 0, &original, sizeof(original)));
+    gurabo_tensor_desc left_shape = matrix_desc(2, 3), right_shape = matrix_desc(3, 2);
+    gurabo_tensor_desc result_shape = matrix_desc(2, 2);
+    OK(gurabo_tensor_create(packed, 0, &left_shape, &left));
+    OK(gurabo_tensor_create(packed, right_offset, &right_shape, &right));
+    OK(gurabo_tensor_create(packed, output_offset, &result_shape, &result));
+    left_shape.flags = right_shape.flags = GURABO_TENSOR_EXPLICIT_STRIDES;
+    left_shape.stride[0] = 1;
+    left_shape.stride[1] = 2;
+    right_shape.stride[0] = 4;
+    right_shape.stride[1] = 2;
+    OK(gurabo_tensor_create(source, 0, &left_shape, &transposed));
+    size_t slice_offset = offsetof(struct source_storage, padded) + sizeof(float);
+    OK(gurabo_tensor_create(source, slice_offset, &right_shape, &sliced));
+    STATUS(gurabo_tensor_copy_async(stream, left, sliced), GURABO_INVALID_ARGUMENT);
+    OK(gurabo_tensor_copy_async(stream, left, transposed));
+    OK(gurabo_tensor_copy_async(stream, right, sliced));
+    OK(gurabo_tensor_release(&transposed));
+    OK(gurabo_tensor_release(&sliced));
+    OK(gurabo_buffer_release(&source));
+    OK(gurabo_matmul_async(stream, result, left, right, NULL));
+    OK(gurabo_tensor_release(&left));
+    OK(gurabo_tensor_release(&right));
+    OK(gurabo_tensor_release(&result));
+    OK(gurabo_buffer_read(stream, actual, packed, output_offset, sizeof(actual)));
+    CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+    OK(gurabo_buffer_release(&packed));
+}
+
 static void check_axpby(gurabo_context *context, gurabo_stream *stream)
 {
     struct accumulation_storage {
@@ -985,6 +1072,8 @@ int main(int argc, char **argv)
     check_empty_reduction(context, stream);
     check_rms_chain(context, stream);
     check_softmax_activation(context, stream);
+    check_tensor_copy_gemm(context, stream);
+    check_tensor_copy_bits(context, stream);
     check_axpby(context, stream);
     check_float16_conversion();
     for (gurabo_dtype dtype = GURABO_F32; dtype <= GURABO_BF16; ++dtype) {

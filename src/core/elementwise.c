@@ -90,6 +90,46 @@ static int shape_equal(const gurabo_tensor_desc *a, const gurabo_tensor_desc *b)
            memcmp(a->extent, b->extent, a->rank * sizeof(a->extent[0])) == 0;
 }
 
+gurabo_status gurabo_tensor_copy_async(gurabo_stream *stream, gurabo_tensor *out,
+                                       const gurabo_tensor *input)
+{
+    if (!stream || !out || !input) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = stream->context;
+    gurabo_backend id = context->backend->id;
+    if (out->buffer->context != context || input->buffer->context != context) {
+        return gb_fail(GURABO_CONTEXT_MISMATCH, id);
+    }
+    if (!shape_equal(&out->desc, &input->desc) || out->desc.dtype != input->desc.dtype) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    if (!out->contiguous) {
+        return gb_fail(GURABO_UNSUPPORTED, id);
+    }
+    if (!out->span || (input->contiguous && out->buffer == input->buffer &&
+                       out->offset == input->offset)) {
+        return GURABO_OK;
+    }
+    if (overlaps(out, input)) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    if (input->contiguous) {
+        return gurabo_buffer_copy_async(stream, out->buffer, out->offset,
+                                        input->buffer, input->offset, out->span);
+    }
+
+    gb_kernel kernel = {.kind = GB_KERNEL_POINTWISE, .args.pointwise = {
+        .op = GB_POINTWISE_COPY_BITS,
+        .element_bytes = (uint32_t)gb_dtype_size(input->desc.dtype),
+        .broadcast_rank = input->desc.rank
+    }};
+    gb_pointwise *args = &kernel.args.pointwise;
+    memcpy(args->extent, input->desc.extent, sizeof(args->extent));
+    memcpy(args->a_stride, input->desc.stride, sizeof(args->a_stride));
+    return submit_pointwise(stream, out, input, NULL, &kernel);
+}
+
 gurabo_status gurabo_tensor_cast_async(gurabo_stream *stream, gurabo_tensor *out,
                                        const gurabo_tensor *input)
 {

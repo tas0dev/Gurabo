@@ -23,6 +23,12 @@ gurabo_status gurabo_matmul_async(gurabo_stream *stream, gurabo_tensor *out,
                                   const gurabo_tensor *a, const gurabo_tensor *b,
                                   const gurabo_matmul_desc *desc);
 
+/* Same shape, layout and transpose/alpha/beta contract as matmul. A and B
+   have matching F32, F16 or BF16 storage. Accumulation and output are F32. */
+gurabo_status gurabo_gemm_async(gurabo_stream *stream, gurabo_tensor *out,
+                                const gurabo_tensor *a, const gurabo_tensor *b,
+                                const gurabo_matmul_desc *desc);
+
 #ifdef __cplusplus
 }
 #endif

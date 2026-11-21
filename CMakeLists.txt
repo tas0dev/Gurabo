@@ -60,6 +60,7 @@ add_library(Gurabo STATIC
     src/gurabo.c
     src/core/device.c
     src/core/error.c
+    src/core/float16.c
     src/core/memory.c
     src/core/stream.c
     src/core/tensor.c

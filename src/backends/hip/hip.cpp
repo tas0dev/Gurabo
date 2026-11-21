@@ -325,10 +325,22 @@ gb_result matmul(void *stream, const gb_matmul *args)
                                                   : rocblas_operation_none;
     rocblas_operation trans_a = args->transpose_a ? rocblas_operation_transpose
                                                   : rocblas_operation_none;
-    return blas_result(rocblas_sgemm(native->blas, trans_b, trans_a,
-                                     args->n, args->m, args->k, &args->alpha,
-                                     args->b, args->b_width, args->a, args->a_width,
-                                     &args->beta, args->out, args->n));
+    if (args->input_dtype == GURABO_F32) {
+        return blas_result(rocblas_sgemm(native->blas, trans_b, trans_a,
+                                         args->n, args->m, args->k, &args->alpha,
+                                         static_cast<const float *>(args->b), args->b_width,
+                                         static_cast<const float *>(args->a), args->a_width,
+                                         &args->beta, args->out, args->n));
+    }
+    rocblas_datatype type = args->input_dtype == GURABO_F16 ? rocblas_datatype_f16_r
+                                                           : rocblas_datatype_bf16_r;
+    // Use the current SDK signature directly, bypassing the legacy workspace macro.
+    return blas_result((rocblas_gemm_ex)(native->blas, trans_b, trans_a,
+                                         args->n, args->m, args->k, &args->alpha,
+                                         args->b, type, args->b_width, args->a, type, args->a_width,
+                                         &args->beta, args->out, rocblas_datatype_f32_r, args->n,
+                                         args->out, rocblas_datatype_f32_r, args->n,
+                                         rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0));
 }
 
 } // namespace
@@ -336,7 +348,8 @@ gb_result matmul(void *stream, const gb_matmul *args)
 const gb_backend gb_hip = {
     GURABO_HIP,
     256,
-    GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_PINNED_HOST_MEMORY,
+    GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_PINNED_HOST_MEMORY |
+        GURABO_FEATURE_F16_GEMM | GURABO_FEATURE_BF16_GEMM,
     count_devices,
     device_info,
     alloc,

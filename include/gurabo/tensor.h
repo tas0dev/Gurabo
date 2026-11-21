@@ -13,6 +13,13 @@ enum {
     GURABO_I8 = 4, GURABO_U8 = 5, GURABO_I32 = 6, GURABO_I64 = 7
 };
 
+/* Host conversion helpers for the 16-bit storage encodings. Narrowing uses
+   round-to-nearest, ties-to-even, independent of the host rounding mode. */
+uint16_t gurabo_f16_from_f32(float value);
+float gurabo_f16_to_f32(uint16_t bits);
+uint16_t gurabo_bf16_from_f32(float value);
+float gurabo_bf16_to_f32(uint16_t bits);
+
 #define GURABO_MAX_RANK 8
 
 enum { GURABO_TENSOR_EXPLICIT_STRIDES = 1u };

@@ -1,10 +1,7 @@
-#include <float.h>
 #include "core.h"
 
-_Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24 &&
-               FLT_MAX_EXP == 128, "Gurabo requires IEEE binary32 float");
-
-static gurabo_status tensor_layout(gurabo_tensor *tensor, const gurabo_tensor_desc *desc)
+static gurabo_status tensor_layout(gurabo_tensor *tensor, const gurabo_tensor_desc *desc,
+                                    size_t element_size)
 {
     gurabo_tensor_desc *shape = &tensor->desc;
     shape->struct_size = GURABO_TENSOR_DESC_SIZE;
@@ -50,10 +47,10 @@ static gurabo_status tensor_layout(gurabo_tensor *tensor, const gurabo_tensor_de
         expected *= extent;
     }
     if (!empty) {
-        if (last >= UINT64_MAX / sizeof(float)) {
+        if (last >= UINT64_MAX / element_size) {
             return GURABO_OUT_OF_RANGE;
         }
-        tensor->span = (last + 1) * sizeof(float);
+        tensor->span = (last + 1) * element_size;
     }
     return GURABO_OK;
 }
@@ -69,16 +66,21 @@ gurabo_status gurabo_tensor_create(gurabo_buffer *buffer, uint64_t byte_offset,
     if (!out || *out || !desc || desc->struct_size < GURABO_TENSOR_DESC_SIZE ||
         desc->rank > GURABO_MAX_RANK ||
         (desc->flags & ~(uint32_t)GURABO_TENSOR_EXPLICIT_STRIDES) ||
-        byte_offset % _Alignof(float) || desc->dtype < GURABO_F32 || desc->dtype > GURABO_I64) {
+        desc->dtype < GURABO_F32 || desc->dtype > GURABO_I64) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
-    if (desc->dtype != GURABO_F32 || buffer->kind != GB_BUFFER_DEVICE) {
+    if (desc->dtype > GURABO_BF16 || buffer->kind != GB_BUFFER_DEVICE) {
         return gb_fail(GURABO_UNSUPPORTED, id);
+    }
+    size_t element_size = desc->dtype == GURABO_F32 ? sizeof(float) : sizeof(uint16_t);
+    size_t alignment = desc->dtype == GURABO_F32 ? _Alignof(float) : _Alignof(uint16_t);
+    if (byte_offset % alignment) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
     gurabo_tensor tensor = {0};
     tensor.buffer = buffer;
     tensor.offset = byte_offset;
-    gurabo_status status = tensor_layout(&tensor, desc);
+    gurabo_status status = tensor_layout(&tensor, desc, element_size);
     if (status != GURABO_OK) {
         return gb_fail(status, id);
     }
@@ -152,9 +154,9 @@ static int tensors_overlap(const gurabo_tensor *a, const gurabo_tensor *b)
     return a->buffer == b->buffer && gb_overlap(a->offset, a->span, b->offset, b->span);
 }
 
-gurabo_status gurabo_matmul_async(gurabo_stream *stream, gurabo_tensor *out,
-                                  const gurabo_tensor *a, const gurabo_tensor *b,
-                                  const gurabo_matmul_desc *desc)
+static gurabo_status submit_gemm(gurabo_stream *stream, gurabo_tensor *out,
+                                 const gurabo_tensor *a, const gurabo_tensor *b,
+                                 const gurabo_matmul_desc *desc, int allow_mixed)
 {
     static const gurabo_matmul_desc defaults = {GURABO_MATMUL_DESC_SIZE, 0, 0, 1.0f, 0.0f};
     if (!stream || !out || !a || !b) {
@@ -174,6 +176,10 @@ gurabo_status gurabo_matmul_async(gurabo_stream *stream, gurabo_tensor *out,
         out->desc.rank != 2) {
         return gb_fail(GURABO_INVALID_ARGUMENT, backend->id);
     }
+    if (out->desc.dtype != GURABO_F32 || a->desc.dtype != b->desc.dtype ||
+        (!allow_mixed && a->desc.dtype != GURABO_F32)) {
+        return gb_fail(GURABO_UNSUPPORTED, backend->id);
+    }
 
     uint64_t m = a->desc.extent[desc->transpose_a];
     uint64_t k = a->desc.extent[1 - desc->transpose_a];
@@ -192,6 +198,7 @@ gurabo_status gurabo_matmul_async(gurabo_stream *stream, gurabo_tensor *out,
         (int32_t)m, (int32_t)n, (int32_t)k,
         (int32_t)a->desc.extent[1], (int32_t)b->desc.extent[1],
         desc->transpose_a, desc->transpose_b, desc->alpha, desc->beta,
+        a->desc.dtype,
         gb_buffer_address(a->buffer, a->offset),
         gb_buffer_address(b->buffer, b->offset),
         gb_buffer_address(out->buffer, out->offset)
@@ -214,4 +221,18 @@ gurabo_status gurabo_matmul_async(gurabo_stream *stream, gurabo_tensor *out,
     }
     gb_unlock(&context->gate);
     return status;
+}
+
+gurabo_status gurabo_matmul_async(gurabo_stream *stream, gurabo_tensor *out,
+                                  const gurabo_tensor *a, const gurabo_tensor *b,
+                                  const gurabo_matmul_desc *desc)
+{
+    return submit_gemm(stream, out, a, b, desc, 0);
+}
+
+gurabo_status gurabo_gemm_async(gurabo_stream *stream, gurabo_tensor *out,
+                                const gurabo_tensor *a, const gurabo_tensor *b,
+                                const gurabo_matmul_desc *desc)
+{
+    return submit_gemm(stream, out, a, b, desc, 1);
 }

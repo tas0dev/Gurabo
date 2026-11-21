@@ -161,16 +161,103 @@ static void benchmark_pipeline(gurabo_backend backend)
     free(storage);
 }
 
+static void benchmark_mixed(gurabo_backend backend)
+{
+    const size_t n = backend == GURABO_CPU ? 128 : 1024;
+    enum { ITERATIONS = 32 };
+    const size_t elements = n * n;
+    const size_t output_bytes = elements * sizeof(float);
+    float *values = malloc(2 * output_bytes);
+    float *result = malloc(output_bytes);
+    uint16_t *encoded = malloc(2 * elements * sizeof(*encoded));
+    if (!values || !result || !encoded) {
+        fputs("Could not allocate host data\n", stderr);
+        exit(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < 2 * elements; ++i) {
+        values[i] = (float)((int)(i % 29) - 14) / 29.0f;
+    }
+
+    gurabo_device_info info = {.struct_size = GURABO_DEVICE_INFO_SIZE};
+    gurabo_context *context = NULL;
+    gurabo_stream *stream = NULL;
+    gurabo_buffer *output = NULL;
+    gurabo_tensor *c = NULL;
+    gurabo_tensor_desc shape = {GURABO_TENSOR_DESC_SIZE, GURABO_F32, 2, 0, {n, n}, {0}};
+    check(gurabo_device_get_info(backend, 0, &info));
+    check(gurabo_context_create(backend, 0, &context));
+    check(gurabo_stream_create(context, &stream));
+    check(gurabo_buffer_alloc(context, output_bytes, 0, &output));
+    check(gurabo_tensor_create(output, 0, &shape, &c));
+    printf("%s (%s), %zu x %zu, %d iterations, FP32 output\n",
+           info.name, info.architecture, n, n, ITERATIONS);
+
+    const char *formats[] = {"FP32", "FP16", "BF16"};
+    for (gurabo_dtype dtype = GURABO_F32; dtype <= GURABO_BF16; ++dtype) {
+        gurabo_buffer *input = NULL;
+        gurabo_tensor *a = NULL, *b = NULL;
+        const void *host_input = values;
+        size_t input_bytes = output_bytes;
+        if (dtype != GURABO_F32) {
+            uint16_t (*encode)(float) =
+                dtype == GURABO_F16 ? gurabo_f16_from_f32 : gurabo_bf16_from_f32;
+            for (size_t i = 0; i < 2 * elements; ++i) {
+                encoded[i] = encode(values[i]);
+            }
+            host_input = encoded;
+            input_bytes = elements * sizeof(*encoded);
+        }
+        shape.dtype = dtype;
+        check(gurabo_buffer_alloc(context, 2 * input_bytes, 0, &input));
+        check(gurabo_tensor_create(input, 0, &shape, &a));
+        check(gurabo_tensor_create(input, input_bytes, &shape, &b));
+        check(gurabo_buffer_write(stream, input, 0, host_input, 2 * input_bytes));
+        check(gurabo_gemm_async(stream, c, a, b, NULL));
+        check(gurabo_buffer_read(stream, result, output, 0, output_bytes));
+
+        double start = now();
+        for (unsigned i = 0; i < ITERATIONS; ++i) {
+            check(gurabo_gemm_async(stream, c, a, b, NULL));
+        }
+        check(gurabo_stream_synchronize(stream));
+        double gemm = now() - start;
+        start = now();
+        for (unsigned i = 0; i < ITERATIONS; ++i) {
+            check(gurabo_buffer_write(stream, input, 0, host_input, 2 * input_bytes));
+            check(gurabo_gemm_async(stream, c, a, b, NULL));
+            check(gurabo_buffer_read(stream, result, output, 0, output_bytes));
+        }
+        double round_trip = now() - start;
+        printf("%s: GEMM %.3f us, with transfers %.3f us per iteration\n",
+               formats[dtype - GURABO_F32], gemm * 1e6 / ITERATIONS,
+               round_trip * 1e6 / ITERATIONS);
+        check(gurabo_tensor_release(&a));
+        check(gurabo_tensor_release(&b));
+        check(gurabo_buffer_release(&input));
+    }
+    check(gurabo_tensor_release(&c));
+    check(gurabo_buffer_release(&output));
+    check(gurabo_stream_destroy(&stream));
+    check(gurabo_context_destroy(&context));
+    free(encoded);
+    free(result);
+    free(values);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 3 || (argc > 1 && strcmp(argv[1], "cpu") != 0 && strcmp(argv[1], "hip") != 0) ||
-        (argc == 3 && strcmp(argv[2], "pipeline") != 0)) {
-        fprintf(stderr, "Usage: %s [cpu|hip [pipeline]]\n", argv[0]);
+        (argc == 3 && strcmp(argv[2], "pipeline") != 0 && strcmp(argv[2], "mixed") != 0)) {
+        fprintf(stderr, "Usage: %s [cpu|hip [pipeline|mixed]]\n", argv[0]);
         return EXIT_FAILURE;
     }
     gurabo_backend backend = argc > 1 && strcmp(argv[1], "hip") == 0 ? GURABO_HIP : GURABO_CPU;
     if (argc == 3) {
-        benchmark_pipeline(backend);
+        if (strcmp(argv[2], "mixed") == 0) {
+            benchmark_mixed(backend);
+        } else {
+            benchmark_pipeline(backend);
+        }
         return EXIT_SUCCESS;
     }
     enum { N = 256, ITERATIONS = 40 };

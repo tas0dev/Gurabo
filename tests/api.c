@@ -65,8 +65,12 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     printf("Testing %s (%s), ordinal %u\n", info.name, info.architecture, (unsigned)ordinal);
     gurabo_device_caps caps = {.struct_size = GURABO_DEVICE_CAPS_SIZE};
     OK(gurabo_device_get_caps(backend, ordinal, &caps));
-    CHECK(caps.storage_dtype_mask == (UINT64_C(1) << GURABO_F32));
+    CHECK(caps.storage_dtype_mask == ((UINT64_C(1) << GURABO_F32) |
+                                      (UINT64_C(1) << GURABO_F16) |
+                                      (UINT64_C(1) << GURABO_BF16)));
     CHECK(caps.feature_mask & GURABO_FEATURE_F32_MATMUL);
+    CHECK(caps.feature_mask & GURABO_FEATURE_F16_GEMM);
+    CHECK(caps.feature_mask & GURABO_FEATURE_BF16_GEMM);
     CHECK(!!(caps.feature_mask & GURABO_FEATURE_PINNED_HOST_MEMORY) == (backend == GURABO_HIP));
     CHECK(caps.max_tensor_rank == GURABO_MAX_RANK && caps.min_buffer_alignment >= sizeof(float));
 
@@ -157,6 +161,17 @@ static void check_layout(gurabo_context *context)
     OK(gurabo_tensor_is_contiguous(tensor, &contiguous));
     CHECK(contiguous == 1);
     OK(gurabo_tensor_release(&tensor));
+
+    for (gurabo_dtype dtype = GURABO_F16; dtype <= GURABO_BF16; ++dtype) {
+        gurabo_tensor_desc half = matrix_desc(1, 2);
+        half.dtype = dtype;
+        STATUS(gurabo_tensor_create(buffer, 59, &half, &tensor), GURABO_INVALID_ARGUMENT);
+        STATUS(gurabo_tensor_create(buffer, 62, &half, &tensor), GURABO_OUT_OF_RANGE);
+        OK(gurabo_tensor_create(buffer, 60, &half, &tensor));
+        OK(gurabo_tensor_get_desc(tensor, &actual));
+        CHECK(actual.dtype == dtype && actual.stride[1] == 1);
+        OK(gurabo_tensor_release(&tensor));
+    }
 
     shape.rank = 0;
     STATUS(gurabo_tensor_create(buffer, 64, &shape, &tensor), GURABO_OUT_OF_RANGE);
@@ -296,9 +311,31 @@ static void check_pinned_memory(gurabo_context *context)
     CHECK(usage == 0);
 }
 
-static void check_matmul(gurabo_context *context, gurabo_stream *stream,
-                         uint32_t trans_a, uint32_t trans_b, float beta,
-                         float actual[8])
+static void check_float16_conversion(void)
+{
+    CHECK(gurabo_f16_from_f32(-0.0f) == 0x8000u);
+    CHECK(gurabo_f16_from_f32(0x1p-25f) == 0);
+    CHECK(gurabo_f16_from_f32(0x1.8p-24f) == 2);
+    CHECK(gurabo_f16_from_f32(1.0f + 0x1p-11f) == 0x3C00u);
+    CHECK(gurabo_f16_from_f32(1.0f + 0x1.8p-10f) == 0x3C02u);
+    CHECK(gurabo_f16_from_f32(65519.0f) == 0x7BFFu);
+    CHECK(gurabo_f16_from_f32(65520.0f) == 0x7C00u);
+    CHECK(gurabo_bf16_from_f32(-0.0f) == 0x8000u);
+    CHECK(gurabo_bf16_from_f32(1.0f + 0x1p-8f) == 0x3F80u);
+    CHECK(gurabo_bf16_from_f32(1.0f + 0x1.8p-7f) == 0x3F82u);
+
+    for (uint32_t i = 0; i <= UINT16_MAX; ++i) {
+        uint16_t bits = (uint16_t)i;
+        uint16_t half = gurabo_f16_from_f32(gurabo_f16_to_f32(bits));
+        uint16_t bfloat = gurabo_bf16_from_f32(gurabo_bf16_to_f32(bits));
+        CHECK(half == ((bits & 0x7FFFu) > 0x7C00u ? (bits | 0x0200u) : bits));
+        CHECK(bfloat == ((bits & 0x7FFFu) > 0x7F80u ? (bits | 0x0040u) : bits));
+    }
+}
+
+static double check_matmul(gurabo_context *context, gurabo_stream *stream,
+                           gurabo_dtype dtype, uint32_t trans_a, uint32_t trans_b,
+                           float beta, float actual[8])
 {
     enum { M = 2, N = 4, K = 3 };
     float a[M * K], b[K * N], c[M * N];
@@ -311,19 +348,38 @@ static void check_matmul(gurabo_context *context, gurabo_stream *stream,
     for (int i = 0; i < M * N; ++i) {
         c[i] = (float)i * 0.13f;
     }
+    float rounded_a[M * K], rounded_b[K * N];
+    memcpy(rounded_a, a, sizeof(a));
+    memcpy(rounded_b, b, sizeof(b));
+    uint16_t encoded_a[M * K], encoded_b[K * N];
+    if (dtype != GURABO_F32) {
+        uint16_t (*encode)(float) = dtype == GURABO_F16 ? gurabo_f16_from_f32 : gurabo_bf16_from_f32;
+        float (*decode)(uint16_t) = dtype == GURABO_F16 ? gurabo_f16_to_f32 : gurabo_bf16_to_f32;
+        for (int i = 0; i < M * K; ++i) {
+            encoded_a[i] = encode(a[i]);
+            rounded_a[i] = decode(encoded_a[i]);
+        }
+        for (int i = 0; i < K * N; ++i) {
+            encoded_b[i] = encode(b[i]);
+            rounded_b[i] = decode(encoded_b[i]);
+        }
+    }
 
     gurabo_buffer *ab = NULL, *bb = NULL, *cb = NULL;
     gurabo_tensor *at = NULL, *bt = NULL, *ct = NULL;
     gurabo_tensor_desc ashape = trans_a ? matrix_desc(K, M) : matrix_desc(M, K);
     gurabo_tensor_desc bshape = trans_b ? matrix_desc(N, K) : matrix_desc(K, N);
     gurabo_tensor_desc cshape = matrix_desc(M, N);
+    ashape.dtype = bshape.dtype = dtype;
     gurabo_matmul_desc config = {GURABO_MATMUL_DESC_SIZE, trans_a, trans_b, -0.75f, beta};
 
-    OK(gurabo_buffer_alloc(context, sizeof(a), 0, &ab));
-    OK(gurabo_buffer_alloc(context, sizeof(b), 0, &bb));
+    size_t a_bytes = dtype == GURABO_F32 ? sizeof(a) : sizeof(encoded_a);
+    size_t b_bytes = dtype == GURABO_F32 ? sizeof(b) : sizeof(encoded_b);
+    OK(gurabo_buffer_alloc(context, a_bytes, 0, &ab));
+    OK(gurabo_buffer_alloc(context, b_bytes, 0, &bb));
     OK(gurabo_buffer_alloc(context, sizeof(c), 0, &cb));
-    OK(gurabo_buffer_write(stream, ab, 0, a, sizeof(a)));
-    OK(gurabo_buffer_write(stream, bb, 0, b, sizeof(b)));
+    OK(gurabo_buffer_write(stream, ab, 0, dtype == GURABO_F32 ? (void *)a : encoded_a, a_bytes));
+    OK(gurabo_buffer_write(stream, bb, 0, dtype == GURABO_F32 ? (void *)b : encoded_b, b_bytes));
     if (beta != 0) {
         OK(gurabo_buffer_write(stream, cb, 0, c, sizeof(c)));
     }
@@ -331,8 +387,15 @@ static void check_matmul(gurabo_context *context, gurabo_stream *stream,
     OK(gurabo_tensor_create(bb, 0, &bshape, &bt));
     OK(gurabo_tensor_create(cb, 0, &cshape, &ct));
 
-    STATUS(gurabo_matmul_async(stream, at, at, bt, &config), GURABO_INVALID_ARGUMENT);
-    OK(gurabo_matmul_async(stream, ct, at, bt, &config));
+    if (dtype == GURABO_F32) {
+        STATUS(gurabo_matmul_async(stream, at, at, bt, &config), GURABO_INVALID_ARGUMENT);
+        OK(gurabo_matmul_async(stream, ct, at, bt, &config));
+    } else {
+        STATUS(gurabo_matmul_async(stream, ct, at, bt, &config), GURABO_UNSUPPORTED);
+        STATUS(gurabo_gemm_async(stream, at, at, bt, &config), GURABO_UNSUPPORTED);
+        STATUS(gurabo_gemm_async(stream, ct, at, ct, &config), GURABO_UNSUPPORTED);
+        OK(gurabo_gemm_async(stream, ct, at, bt, &config));
+    }
     OK(gurabo_tensor_release(&at));
     OK(gurabo_tensor_release(&bt));
     OK(gurabo_tensor_release(&ct));
@@ -341,18 +404,26 @@ static void check_matmul(gurabo_context *context, gurabo_stream *stream,
     OK(gurabo_buffer_read(stream, actual, cb, 0, sizeof(c)));
     OK(gurabo_buffer_release(&cb));
 
+    double max_input_rounding = 0;
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
             int index = i * N + j;
             double reference = (double)beta * c[index];
+            double full_precision = reference;
             for (int k = 0; k < K; ++k) {
-                double av = a[trans_a ? k * M + i : i * K + k];
-                double bv = b[trans_b ? j * K + k : k * N + j];
-                reference += (double)config.alpha * av * bv;
+                int ai = trans_a ? k * M + i : i * K + k;
+                int bi = trans_b ? j * K + k : k * N + j;
+                reference += (double)config.alpha * rounded_a[ai] * rounded_b[bi];
+                full_precision += (double)config.alpha * a[ai] * b[bi];
             }
             CHECK(fabs((double)actual[index] - reference) <= 2e-6 * (1 + fabs(reference)));
+            double input_rounding = fabs(reference - full_precision);
+            if (input_rounding > max_input_rounding) {
+                max_input_rounding = input_rounding;
+            }
         }
     }
+    return max_input_rounding;
 }
 
 int main(int argc, char **argv)
@@ -399,20 +470,31 @@ int main(int argc, char **argv)
     check_layout(context);
     check_events(backend, ordinal, context);
     check_pinned_memory(context);
-    for (uint32_t ta = 0; ta < 2; ++ta) {
-        for (uint32_t tb = 0; tb < 2; ++tb) {
-            for (int use_beta = 0; use_beta <= 1; ++use_beta) {
-                float actual[8];
-                float beta = use_beta ? 0.5f : 0.0f;
-                check_matmul(context, stream, ta, tb, beta, actual);
-                if (cpu_stream) {
-                    float cpu[8];
-                    check_matmul(cpu_context, cpu_stream, ta, tb, beta, cpu);
-                    for (size_t i = 0; i < sizeof(cpu) / sizeof(cpu[0]); ++i) {
-                        CHECK(fabsf(actual[i] - cpu[i]) <= 4e-6f * (1 + fabsf(cpu[i])));
+    check_float16_conversion();
+    for (gurabo_dtype dtype = GURABO_F32; dtype <= GURABO_BF16; ++dtype) {
+        double max_input_rounding = 0;
+        for (uint32_t ta = 0; ta < 2; ++ta) {
+            for (uint32_t tb = 0; tb < 2; ++tb) {
+                for (int use_beta = 0; use_beta <= 1; ++use_beta) {
+                    float actual[8];
+                    float beta = use_beta ? 0.5f : 0.0f;
+                    double rounding = check_matmul(context, stream, dtype, ta, tb, beta, actual);
+                    if (rounding > max_input_rounding) {
+                        max_input_rounding = rounding;
+                    }
+                    if (cpu_stream) {
+                        float cpu[8];
+                        check_matmul(cpu_context, cpu_stream, dtype, ta, tb, beta, cpu);
+                        for (size_t i = 0; i < sizeof(cpu) / sizeof(cpu[0]); ++i) {
+                            CHECK(fabsf(actual[i] - cpu[i]) <= 4e-6f * (1 + fabsf(cpu[i])));
+                        }
                     }
                 }
             }
+        }
+        if (dtype != GURABO_F32) {
+            printf("%s maximum absolute output error from rounding inputs: %.8g\n",
+                   dtype == GURABO_F16 ? "FP16" : "BF16", max_input_rounding);
         }
     }
     gurabo_error_info error = {.struct_size = GURABO_ERROR_INFO_SIZE, .status = 123};

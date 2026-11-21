@@ -73,12 +73,19 @@ static gb_result cpu_transfer(void *stream, void *dst, const void *src, size_t b
                     to_device ? GB_COPY_HOST_TO_DEVICE : GB_COPY_DEVICE_TO_HOST);
 }
 
-static float load_f32(const float *buffer, size_t index)
+static float load_f32(const void *buffer, size_t index)
 {
     float value;
     /* Buffer transfers may have initialized the data through a byte array. */
     memcpy(&value, (const unsigned char *)buffer + index * sizeof(value), sizeof(value));
     return value;
+}
+
+static float load_f16(const void *buffer, size_t index, gurabo_dtype dtype)
+{
+    uint16_t bits;
+    memcpy(&bits, (const unsigned char *)buffer + index * sizeof(bits), sizeof(bits));
+    return dtype == GURABO_F16 ? gurabo_f16_to_f32(bits) : gurabo_bf16_to_f32(bits);
 }
 
 static gb_result cpu_matmul(void *stream, const gb_matmul *args)
@@ -89,15 +96,24 @@ static gb_result cpu_matmul(void *stream, const gb_matmul *args)
     size_t k = (size_t)args->k;
     size_t a_width = (size_t)args->a_width;
     size_t b_width = (size_t)args->b_width;
+    size_t a_step = args->transpose_a ? a_width : 1;
+    size_t b_step = args->transpose_b ? 1 : b_width;
 
     for (size_t row = 0; row < m; ++row) {
         for (size_t column = 0; column < n; ++column) {
             float sum = 0.0f;
             if (args->alpha != 0.0f) {
-                for (size_t i = 0; i < k; ++i) {
-                    size_t a_index = args->transpose_a ? i * a_width + row : row * a_width + i;
-                    size_t b_index = args->transpose_b ? column * b_width + i : i * b_width + column;
-                    sum += load_f32(args->a, a_index) * load_f32(args->b, b_index);
+                size_t a_index = args->transpose_a ? row : row * a_width;
+                size_t b_index = args->transpose_b ? column * b_width : column;
+                if (args->input_dtype == GURABO_F32) {
+                    for (size_t i = 0; i < k; ++i, a_index += a_step, b_index += b_step) {
+                        sum += load_f32(args->a, a_index) * load_f32(args->b, b_index);
+                    }
+                } else {
+                    for (size_t i = 0; i < k; ++i, a_index += a_step, b_index += b_step) {
+                        sum += load_f16(args->a, a_index, args->input_dtype) *
+                               load_f16(args->b, b_index, args->input_dtype);
+                    }
                 }
             }
             size_t index = row * n + column;
@@ -114,7 +130,7 @@ static gb_result cpu_matmul(void *stream, const gb_matmul *args)
 const gb_backend gb_cpu = {
     .id = GURABO_CPU,
     .alignment = 64,
-    .features = GURABO_FEATURE_F32_MATMUL,
+    .features = GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_F16_GEMM | GURABO_FEATURE_BF16_GEMM,
     .device_count = cpu_count,
     .device_info = cpu_info,
     .alloc = cpu_alloc,

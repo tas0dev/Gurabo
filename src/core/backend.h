@@ -35,8 +35,9 @@ typedef struct {
     int32_t a_width, b_width;
     uint32_t transpose_a, transpose_b;
     float alpha, beta;
-    const float *a;
-    const float *b;
+    gurabo_dtype input_dtype;
+    const void *a;
+    const void *b;
     float *out;
 } gb_matmul;
 

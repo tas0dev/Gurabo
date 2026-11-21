@@ -25,6 +25,7 @@
 #define GB_ROW_SOFTMAX 5u
 #define GB_ROW_LAYER_NORM 6u
 #define GB_ROW_THREADS 256u
+#define GB_TRANSPOSE_TILE 32u
 
 /* This layout is shared by the host and the compiled HIP kernel. */
 typedef struct {
@@ -282,6 +283,14 @@ GB_KERNEL_INLINE void gb_copy_element(unsigned char *dst, const unsigned char *s
     case 4: GB_KERNEL_MEMCPY(dst, src, 4); break;
     case 8: GB_KERNEL_MEMCPY(dst, src, 8); break;
     }
+}
+
+/* The input is a permutation of a dense two-dimensional matrix. */
+GB_KERNEL_INLINE int gb_is_transpose_copy(const gb_pointwise *args)
+{
+    return args->op == GB_POINTWISE_COPY_BITS && args->element_bytes == sizeof(uint32_t) &&
+           args->broadcast_rank == 2 && args->a_stride[0] == 1 &&
+           args->a_stride[1] == args->extent[0];
 }
 
 GB_KERNEL_INLINE void gb_pointwise_apply(const gb_pointwise *args, uint64_t index)

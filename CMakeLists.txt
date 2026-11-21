@@ -156,4 +156,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/GuraboConfig.cmake"
 if(GURABO_BUILD_BENCHMARKS)
     add_executable(gurabo_benchmark benchmarks/matmul.c)
     target_link_libraries(gurabo_benchmark PRIVATE Gurabo::Gurabo)
+    if(NOT MSVC)
+        target_link_libraries(gurabo_benchmark PRIVATE m)
+    endif()
 endif()

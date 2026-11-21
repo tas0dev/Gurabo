@@ -84,6 +84,7 @@ struct embedding_result {
 struct kernel_module {
     hipModule_t module = nullptr;
     hipFunction_t pointwise = nullptr;
+    hipFunction_t transpose_copy = nullptr;
     hipFunction_t rowwise = nullptr;
     hipFunction_t embedding = nullptr;
     embedding_result *available_results = nullptr;
@@ -159,6 +160,9 @@ gb_result kernel_prepare(uint32_t ordinal, void **state)
     error = hipModuleLoadData(&module->module, code.get());
     if (error == hipSuccess) {
         error = hipModuleGetFunction(&module->pointwise, module->module, "gurabo_pointwise");
+        if (error == hipSuccess) {
+            error = hipModuleGetFunction(&module->transpose_copy, module->module, "gurabo_transpose_copy");
+        }
         if (error == hipSuccess) {
             error = hipModuleGetFunction(&module->rowwise, module->module, "gurabo_rowwise");
         }
@@ -272,9 +276,17 @@ gb_result kernel_launch(void *stream, void *state, const gb_kernel *kernel, void
         function = module->rowwise;
         kernel_args[0] = &parameters.args.rowwise;
     } else {
-        blocks = (kernel->args.pointwise.count + threads - 1) / threads;
-        function = module->pointwise;
-        kernel_args[0] = &parameters.args.pointwise;
+        auto &args = parameters.args.pointwise;
+        if (gb_is_transpose_copy(&args)) {
+            uint64_t rows = (args.extent[0] + GB_TRANSPOSE_TILE - 1) / GB_TRANSPOSE_TILE;
+            uint64_t cols = (args.extent[1] + GB_TRANSPOSE_TILE - 1) / GB_TRANSPOSE_TILE;
+            blocks = rows * cols;
+            function = module->transpose_copy;
+        } else {
+            blocks = (args.count + threads - 1) / threads;
+            function = module->pointwise;
+        }
+        kernel_args[0] = &args;
     }
     unsigned grid = blocks < max_blocks ? static_cast<unsigned>(blocks) : max_blocks;
     hipError_t error = hipModuleLaunchKernel(function, grid, 1, 1, threads, 1, 1,

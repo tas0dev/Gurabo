@@ -89,8 +89,44 @@ static float load_f16(const void *buffer, size_t index, gurabo_dtype dtype)
     return dtype == GURABO_F16 ? gurabo_f16_to_f32(bits) : gurabo_bf16_to_f32(bits);
 }
 
+static void cpu_matmul_f32_rows(const gb_matmul *args)
+{
+    enum { TILE = 64 };
+    size_t m = (size_t)args->m, n = (size_t)args->n, k = (size_t)args->k;
+    size_t a_width = (size_t)args->a_width;
+    size_t a_step = args->transpose_a ? a_width : 1;
+    for (size_t row = 0; row < m; ++row) {
+        for (size_t start = 0; start < n; start += TILE) {
+            size_t columns = n - start < TILE ? n - start : TILE;
+            float sums[TILE] = {0};
+            if (args->alpha != 0.0f) {
+                size_t a_index = args->transpose_a ? row : row * a_width;
+                for (size_t i = 0; i < k; ++i, a_index += a_step) {
+                    float a = load_f32(args->a, a_index);
+                    size_t b_index = i * n + start;
+                    for (size_t col = 0; col < columns; ++col) {
+                        sums[col] += a * load_f32(args->b, b_index + col);
+                    }
+                }
+            }
+            for (size_t col = 0; col < columns; ++col) {
+                size_t index = row * n + start + col;
+                float value = args->alpha * sums[col];
+                if (args->beta != 0.0f) {
+                    value += args->beta * load_f32(args->out, index);
+                }
+                gb_store_float(args->out, index, GB_POINTWISE_F32, value);
+            }
+        }
+    }
+}
+
 static void cpu_matmul_matrix(const gb_matmul *args)
 {
+    if (args->input_dtype == GURABO_F32 && !args->transpose_b && args->n >= 16) {
+        cpu_matmul_f32_rows(args);
+        return;
+    }
     size_t m = (size_t)args->m;
     size_t n = (size_t)args->n;
     size_t k = (size_t)args->k;
@@ -144,6 +180,8 @@ static void cpu_softmax_row(const gb_rowwise *args, uint64_t row)
 {
     uint64_t start = row * args->columns;
     uint64_t mask = gb_softmax_mask_base(args, row);
+    /* F32 output can hold the unnormalized terms without rounding them. */
+    int stage_terms = args->input_dtype == GB_POINTWISE_F32;
     float maximum = gb_float_from_bits(0xFF800000u);
     for (uint64_t col = 0; col < args->columns; ++col) {
         if (gb_softmax_keep(args, mask, col)) {
@@ -153,14 +191,21 @@ static void cpu_softmax_row(const gb_rowwise *args, uint64_t row)
     float sum = 0.0f;
     for (uint64_t col = 0; col < args->columns; ++col) {
         if (gb_softmax_keep(args, mask, col)) {
-            sum += gb_softmax_term(gb_load_float(args->input, start + col, args->input_dtype), maximum);
+            float term = gb_softmax_term(gb_load_float(args->input, start + col, args->input_dtype),
+                                         maximum);
+            sum += term;
+            if (stage_terms) {
+                gb_store_float(args->out, start + col, GB_POINTWISE_F32, term);
+            }
         }
     }
     for (uint64_t col = 0; col < args->columns; ++col) {
         float value = 0.0f;
         if (sum != 0.0f && gb_softmax_keep(args, mask, col)) {
-            value = gb_softmax_term(gb_load_float(args->input, start + col, args->input_dtype),
-                                    maximum) / sum;
+            float term = stage_terms ? gb_load_float(args->out, start + col, GB_POINTWISE_F32)
+                       : gb_softmax_term(gb_load_float(args->input, start + col, args->input_dtype),
+                                         maximum);
+            value = term / sum;
         }
         gb_store_float(args->out, start + col, args->input_dtype, value);
     }
@@ -240,6 +285,25 @@ static gb_result cpu_embedding(const gb_embedding *args)
     return gb_status(invalid ? GURABO_OUT_OF_RANGE : GURABO_OK);
 }
 
+static void cpu_transpose_copy(const gb_pointwise *args)
+{
+    const unsigned char *source = args->a;
+    unsigned char *dest = args->out;
+    uint64_t rows = args->extent[0], columns = args->extent[1];
+    for (uint64_t row = 0; row < rows; row += GB_TRANSPOSE_TILE) {
+        uint64_t bottom = rows - row < GB_TRANSPOSE_TILE ? rows : row + GB_TRANSPOSE_TILE;
+        for (uint64_t col = 0; col < columns; col += GB_TRANSPOSE_TILE) {
+            uint64_t right = columns - col < GB_TRANSPOSE_TILE ? columns : col + GB_TRANSPOSE_TILE;
+            for (uint64_t y = row; y < bottom; ++y) {
+                for (uint64_t x = col; x < right; ++x) {
+                    memcpy(dest + (y * columns + x) * sizeof(uint32_t),
+                           source + (x * rows + y) * sizeof(uint32_t), sizeof(uint32_t));
+                }
+            }
+        }
+    }
+}
+
 static gb_result cpu_kernel_launch(void *stream, void *state, const gb_kernel *kernel,
                                     void **completion)
 {
@@ -253,8 +317,12 @@ static gb_result cpu_kernel_launch(void *stream, void *state, const gb_kernel *k
         cpu_rowwise(&kernel->args.rowwise);
     } else {
         const gb_pointwise *args = &kernel->args.pointwise;
-        for (uint64_t i = 0; i < args->count; ++i) {
-            gb_pointwise_apply(args, i);
+        if (gb_is_transpose_copy(args)) {
+            cpu_transpose_copy(args);
+        } else {
+            for (uint64_t i = 0; i < args->count; ++i) {
+                gb_pointwise_apply(args, i);
+            }
         }
     }
     return gb_status(GURABO_OK);

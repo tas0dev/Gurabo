@@ -1,6 +1,7 @@
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
 #endif
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -244,23 +245,111 @@ static void benchmark_mixed(gurabo_backend backend)
     free(values);
 }
 
+static void benchmark_layout(gurabo_backend backend)
+{
+    enum { N = 1024, ITERATIONS = 32 };
+    const size_t bytes = (size_t)N * N * sizeof(float);
+    float *input = malloc(bytes);
+    float *output = malloc(bytes);
+    if (!input || !output) {
+        fputs("Could not allocate host data\n", stderr);
+        exit(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < (size_t)N * N; ++i) {
+        input[i] = (float)((int)(i % 61) - 30) / 12.0f;
+    }
+    gurabo_context *context = NULL;
+    gurabo_stream *stream = NULL;
+    gurabo_buffer *source = NULL, *dest = NULL;
+    gurabo_tensor *x = NULL, *y = NULL, *transposed = NULL;
+    gurabo_tensor_desc shape = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = GURABO_F32,
+                                .rank = 2, .extent = {N, N}};
+    gurabo_device_info info = {.struct_size = GURABO_DEVICE_INFO_SIZE};
+    check(gurabo_device_get_info(backend, 0, &info));
+    check(gurabo_context_create(backend, 0, &context));
+    check(gurabo_stream_create(context, &stream));
+    check(gurabo_buffer_alloc(context, bytes, 0, &source));
+    check(gurabo_buffer_alloc(context, bytes, 0, &dest));
+    check(gurabo_tensor_create(source, 0, &shape, &x));
+    check(gurabo_tensor_create(dest, 0, &shape, &y));
+    check(gurabo_tensor_transpose(x, 0, 1, &transposed));
+    check(gurabo_buffer_write(stream, source, 0, input, bytes));
+    check(gurabo_tensor_copy_async(stream, y, transposed));
+    check(gurabo_stream_synchronize(stream));
+    double started = now();
+    for (unsigned i = 0; i < ITERATIONS; ++i) {
+        check(gurabo_tensor_copy_async(stream, y, transposed));
+    }
+    check(gurabo_stream_synchronize(stream));
+    double copy_time = now() - started;
+    check(gurabo_buffer_read(stream, output, dest, 0, bytes));
+    for (size_t row = 0; row < N; ++row) {
+        for (size_t col = 0; col < N; ++col) {
+            if (output[row * N + col] != input[col * N + row]) {
+                fprintf(stderr, "Transpose copy mismatch at (%zu, %zu)\n", row, col);
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+
+    check(gurabo_softmax_async(stream, y, x, 1, NULL));
+    check(gurabo_stream_synchronize(stream));
+    started = now();
+    for (unsigned i = 0; i < ITERATIONS; ++i) {
+        check(gurabo_softmax_async(stream, y, x, 1, NULL));
+    }
+    check(gurabo_stream_synchronize(stream));
+    double softmax_time = now() - started;
+    check(gurabo_buffer_read(stream, output, dest, 0, bytes));
+    for (size_t row = 0; row < N; ++row) {
+        size_t start = row * N;
+        double sum = 0;
+        for (size_t col = 0; col < N; ++col) {
+            sum += exp((double)input[start + col]);
+        }
+        for (size_t col = 0; col < N; ++col) {
+            double reference = exp((double)input[start + col]) / sum;
+            if (!(fabs(output[start + col] - reference) <= 1e-6)) {
+                fprintf(stderr, "Softmax mismatch at (%zu, %zu)\n", row, col);
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+    printf("%s (%s), FP32, %d x %d, %d iterations\n", info.name, info.architecture, N, N, ITERATIONS);
+    printf("Transpose copy %.3f us/op (%.3f GB/s including reads and writes)\n",
+           copy_time * 1e6 / ITERATIONS, 2.0 * bytes * ITERATIONS / copy_time / 1e9);
+    printf("Softmax %.3f us/op, both results verified\n", softmax_time * 1e6 / ITERATIONS);
+    check(gurabo_tensor_release(&transposed));
+    check(gurabo_tensor_release(&y));
+    check(gurabo_tensor_release(&x));
+    check(gurabo_buffer_release(&dest));
+    check(gurabo_buffer_release(&source));
+    check(gurabo_stream_destroy(&stream));
+    check(gurabo_context_destroy(&context));
+    free(output);
+    free(input);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 3 || (argc > 1 && strcmp(argv[1], "cpu") != 0 && strcmp(argv[1], "hip") != 0) ||
-        (argc == 3 && strcmp(argv[2], "pipeline") != 0 && strcmp(argv[2], "mixed") != 0)) {
-        fprintf(stderr, "Usage: %s [cpu|hip [pipeline|mixed]]\n", argv[0]);
+        (argc == 3 && strcmp(argv[2], "pipeline") != 0 && strcmp(argv[2], "mixed") != 0 &&
+         strcmp(argv[2], "layout") != 0)) {
+        fprintf(stderr, "Usage: %s [cpu|hip [pipeline|mixed|layout]]\n", argv[0]);
         return EXIT_FAILURE;
     }
     gurabo_backend backend = argc > 1 && strcmp(argv[1], "hip") == 0 ? GURABO_HIP : GURABO_CPU;
     if (argc == 3) {
         if (strcmp(argv[2], "mixed") == 0) {
             benchmark_mixed(backend);
+        } else if (strcmp(argv[2], "layout") == 0) {
+            benchmark_layout(backend);
         } else {
             benchmark_pipeline(backend);
         }
         return EXIT_SUCCESS;
     }
-    enum { N = 256, ITERATIONS = 40 };
+    enum { N = 512, ITERATIONS = 12 };
     const size_t bytes = (size_t)N * N * sizeof(float);
     float *data = malloc(bytes);
     if (!data) {
@@ -288,6 +377,20 @@ int main(int argc, char **argv)
     check(gurabo_matmul_async(stream, c, a, a, NULL));
     check(gurabo_stream_synchronize(stream));
     check(gurabo_buffer_read(stream, data, output, 0, bytes));
+    for (size_t row = 0; row < N; row += 131) {
+        for (size_t col = 0; col < N; col += 127) {
+            double expected = 0;
+            for (size_t k = 0; k < N; ++k) {
+                float a_value = (float)((row * N + k) % 17) / 17.0f;
+                float b_value = (float)((k * N + col) % 17) / 17.0f;
+                expected += (double)a_value * b_value;
+            }
+            if (!(fabs(data[row * N + col] - expected) <= 1e-5 * (1 + fabs(expected)))) {
+                fprintf(stderr, "GEMM mismatch at (%zu, %zu)\n", row, col);
+                return EXIT_FAILURE;
+            }
+        }
+    }
 
     double start = now();
     for (int i = 0; i < ITERATIONS; ++i) {

@@ -21,6 +21,35 @@ extern "C" __global__ void gurabo_pointwise(gb_pointwise args)
     }
 }
 
+extern "C" __global__ void gurabo_transpose_copy(gb_pointwise args)
+{
+    __shared__ uint32_t tile[GB_TRANSPOSE_TILE][GB_TRANSPOSE_TILE + 1];
+    const unsigned x = threadIdx.x % GB_TRANSPOSE_TILE;
+    const unsigned first_y = threadIdx.x / GB_TRANSPOSE_TILE;
+    const unsigned y_step = blockDim.x / GB_TRANSPOSE_TILE;
+    const uint64_t rows = args.extent[0], cols = args.extent[1];
+    const uint64_t col_tiles = (cols + GB_TRANSPOSE_TILE - 1) / GB_TRANSPOSE_TILE;
+    const uint64_t row_tiles = (rows + GB_TRANSPOSE_TILE - 1) / GB_TRANSPOSE_TILE;
+    const uint32_t *src = (const uint32_t *)args.a;
+    uint32_t *dst = (uint32_t *)args.out;
+    for (uint64_t block = blockIdx.x; block < row_tiles * col_tiles; block += gridDim.x) {
+        uint64_t row0 = (block / col_tiles) * GB_TRANSPOSE_TILE;
+        uint64_t col0 = (block % col_tiles) * GB_TRANSPOSE_TILE;
+        for (unsigned y = first_y; y < GB_TRANSPOSE_TILE; y += y_step) {
+            if (row0 + x < rows && col0 + y < cols) {
+                tile[y][x] = src[(col0 + y) * rows + row0 + x];
+            }
+        }
+        __syncthreads();
+        for (unsigned y = first_y; y < GB_TRANSPOSE_TILE; y += y_step) {
+            if (row0 + y < rows && col0 + x < cols) {
+                dst[(row0 + y) * cols + col0 + x] = tile[x][y];
+            }
+        }
+        __syncthreads();
+    }
+}
+
 static __device__ float block_reduce(float *partial, float value, bool max)
 {
     unsigned tid = threadIdx.x;

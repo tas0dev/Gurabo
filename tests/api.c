@@ -1043,9 +1043,9 @@ static void check_axpby(gurabo_context *context, gurabo_stream *stream)
     OK(gurabo_buffer_release(&buffer));
 }
 
-static void check_multi_axis_gemm(gurabo_context *context, gurabo_stream *stream)
+static void check_multi_axis_gemm(gurabo_context *context, gurabo_stream *stream, uint32_t transpose_b)
 {
-    enum { GROUPS = 2, HEADS = 3, M = 2, K = 3, N = 2 };
+    enum { GROUPS = 2, HEADS = 3, M = 2, K = 3, N = 67 };
     float a[GROUPS * M * K], b[HEADS * N * K], c[GROUPS * HEADS * M * N];
     for (size_t i = 0; i < sizeof(a) / sizeof(a[0]); ++i) a[i] = (float)i - 5;
     for (size_t i = 0; i < sizeof(b) / sizeof(b[0]); ++i) b[i] = (float)(i % 8) - 3;
@@ -1056,7 +1056,7 @@ static void check_multi_axis_gemm(gurabo_context *context, gurabo_stream *stream
     gurabo_tensor_desc ashape = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = GURABO_F32,
                                  .rank = 4, .extent = {GROUPS, 1, M, K}};
     gurabo_tensor_desc bshape = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = GURABO_F32,
-                                 .rank = 3, .extent = {HEADS, N, K}};
+                                 .rank = 3, .extent = {HEADS, transpose_b ? N : K, transpose_b ? K : N}};
     gurabo_tensor_desc cshape = {.struct_size = GURABO_TENSOR_DESC_SIZE, .dtype = GURABO_F32,
                                  .rank = 4, .extent = {GROUPS, HEADS, M, N}};
     OK(gurabo_tensor_create(buffer, 0, &ashape, &at));
@@ -1066,7 +1066,7 @@ static void check_multi_axis_gemm(gurabo_context *context, gurabo_stream *stream
     OK(gurabo_buffer_write(stream, buffer, sizeof(a), b, sizeof(b)));
     const float one = 1.0f;
     OK(gurabo_tensor_fill_async(stream, ct, &one));
-    const gurabo_matmul_desc options = {GURABO_MATMUL_DESC_SIZE, 0, 1, 0.5f, 2.0f};
+    const gurabo_matmul_desc options = {GURABO_MATMUL_DESC_SIZE, 0, transpose_b, 0.5f, 2.0f};
     OK(gurabo_matmul_async(stream, ct, at, bt, &options));
     OK(gurabo_buffer_read(stream, c, buffer, out_offset, sizeof(c)));
     for (size_t g = 0; g < GROUPS; ++g) {
@@ -1075,7 +1075,8 @@ static void check_multi_axis_gemm(gurabo_context *context, gurabo_stream *stream
                 for (size_t col = 0; col < N; ++col) {
                     double expected = 2.0;
                     for (size_t k = 0; k < K; ++k) {
-                        expected += 0.5 * a[(g * M + row) * K + k] * b[(h * N + col) * K + k];
+                        size_t offset = transpose_b ? col * K + k : k * N + col;
+                        expected += 0.5 * a[(g * M + row) * K + k] * b[h * N * K + offset];
                     }
                     CHECK(c[((g * HEADS + h) * M + row) * N + col] == (float)expected);
                 }
@@ -1275,7 +1276,8 @@ int main(int argc, char **argv)
     check_rms_chain(context, stream);
     check_softmax_activation(context, stream);
     check_tensor_copy_gemm(context, stream);
-    check_multi_axis_gemm(context, stream);
+    check_multi_axis_gemm(context, stream, 0);
+    check_multi_axis_gemm(context, stream, 1);
     check_tensor_copy_bits(context, stream);
     check_initializers(context, stream);
     check_axpby(context, stream);

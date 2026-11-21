@@ -1,0 +1,4 @@
+#ifndef GURABO_ERROR_H
+#define GURABO_ERROR_H
+
+#endif //GURABO_ERROR_H

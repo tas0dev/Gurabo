@@ -1,4 +1,4 @@
-#include "../include/gurabo.h"
+#include "gurabo.h"
 
 #include <stdio.h>
 

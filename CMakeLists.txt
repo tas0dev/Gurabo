@@ -3,4 +3,7 @@ project(Gurabo C)
 
 set(CMAKE_C_STANDARD 11)
 
-add_library(Gurabo STATIC src/gurabo.c)
+include_directories(include)
+
+add_library(Gurabo STATIC src/gurabo.c
+        include/error.h)

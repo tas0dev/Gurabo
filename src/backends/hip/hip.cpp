@@ -540,6 +540,13 @@ gb_result matmul(void *stream, const gb_matmul *args)
     rocblas_operation trans_a = args->transpose_a ? rocblas_operation_transpose
                                                   : rocblas_operation_none;
     if (args->input_dtype == GURABO_F32) {
+        if (args->batches > 1) {
+            return blas_result(rocblas_sgemm_strided_batched(
+                native->blas, trans_b, trans_a, args->n, args->m, args->k, &args->alpha,
+                static_cast<const float *>(args->b), args->b_width, args->stride_b,
+                static_cast<const float *>(args->a), args->a_width, args->stride_a,
+                &args->beta, args->out, args->n, args->stride_out, args->batches));
+        }
         return blas_result(rocblas_sgemm(native->blas, trans_b, trans_a,
                                          args->n, args->m, args->k, &args->alpha,
                                          static_cast<const float *>(args->b), args->b_width,
@@ -549,6 +556,15 @@ gb_result matmul(void *stream, const gb_matmul *args)
     rocblas_datatype type = args->input_dtype == GURABO_F16 ? rocblas_datatype_f16_r
                                                            : rocblas_datatype_bf16_r;
     // Use the current SDK signature directly, bypassing the legacy workspace macro.
+    if (args->batches > 1) {
+        return blas_result((rocblas_gemm_strided_batched_ex)(
+            native->blas, trans_b, trans_a, args->n, args->m, args->k, &args->alpha,
+            args->b, type, args->b_width, args->stride_b,
+            args->a, type, args->a_width, args->stride_a,
+            &args->beta, args->out, rocblas_datatype_f32_r, args->n, args->stride_out,
+            args->out, rocblas_datatype_f32_r, args->n, args->stride_out, args->batches,
+            rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0));
+    }
     return blas_result((rocblas_gemm_ex)(native->blas, trans_b, trans_a,
                                          args->n, args->m, args->k, &args->alpha,
                                          args->b, type, args->b_width, args->a, type, args->a_width,
@@ -567,7 +583,7 @@ const gb_backend gb_hip = {
         GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL |
         GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM |
         GURABO_FEATURE_ACTIVATION | GURABO_FEATURE_SOFTMAX | GURABO_FEATURE_BINARY_SUB_DIV |
-        GURABO_FEATURE_EMBEDDING,
+        GURABO_FEATURE_EMBEDDING | GURABO_FEATURE_BATCHED_GEMM,
     count_devices,
     device_info,
     alloc,

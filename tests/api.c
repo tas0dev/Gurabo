@@ -82,6 +82,7 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     CHECK(caps.feature_mask & GURABO_FEATURE_SOFTMAX);
     CHECK(caps.feature_mask & GURABO_FEATURE_EMBEDDING);
     CHECK(caps.feature_mask & GURABO_FEATURE_BINARY_SUB_DIV);
+    CHECK(caps.feature_mask & GURABO_FEATURE_BATCHED_GEMM);
     CHECK(!!(caps.feature_mask & GURABO_FEATURE_PINNED_HOST_MEMORY) == (backend == GURABO_HIP));
     CHECK(caps.max_tensor_rank == GURABO_MAX_RANK && caps.min_buffer_alignment >= sizeof(float));
 
@@ -761,33 +762,50 @@ static void check_embedding_failure(gurabo_backend backend, uint32_t ordinal)
     STATUS(gurabo_context_destroy(&context), GURABO_OUT_OF_RANGE);
 }
 
+enum { GEMM_MAX_BATCH = 2, GEMM_OUTPUT_SIZE = 8 };
+
+static gurabo_tensor_desc batched_matrix_desc(gurabo_tensor_desc shape, uint32_t batches)
+{
+    if (batches) {
+        shape.rank = 3;
+        shape.extent[2] = shape.extent[1];
+        shape.extent[1] = shape.extent[0];
+        shape.extent[0] = batches;
+    }
+    return shape;
+}
+
 static double check_matmul(gurabo_context *context, gurabo_stream *stream,
                            gurabo_dtype dtype, uint32_t trans_a, uint32_t trans_b,
-                           float beta, float actual[8])
+                           float beta, uint32_t a_batches, uint32_t b_batches, float *actual)
 {
     enum { M = 2, N = 4, K = 3 };
-    float a[M * K], b[K * N], c[M * N];
-    for (int i = 0; i < M * K; ++i) {
+    uint32_t batches = a_batches > b_batches ? a_batches : b_batches;
+    int a_count = M * K * (a_batches ? (int)a_batches : 1);
+    int b_count = K * N * (b_batches ? (int)b_batches : 1);
+    int c_count = M * N * (batches ? (int)batches : 1);
+    float a[GEMM_MAX_BATCH * M * K], b[GEMM_MAX_BATCH * K * N], c[GEMM_MAX_BATCH * M * N];
+    for (int i = 0; i < a_count; ++i) {
         a[i] = (float)(i - 2) * 0.29f;
     }
-    for (int i = 0; i < K * N; ++i) {
+    for (int i = 0; i < b_count; ++i) {
         b[i] = (float)(i % 7 - 3) * 0.37f;
     }
-    for (int i = 0; i < M * N; ++i) {
+    for (int i = 0; i < c_count; ++i) {
         c[i] = (float)i * 0.13f;
     }
-    float rounded_a[M * K], rounded_b[K * N];
-    memcpy(rounded_a, a, sizeof(a));
-    memcpy(rounded_b, b, sizeof(b));
-    uint16_t encoded_a[M * K], encoded_b[K * N];
+    float rounded_a[GEMM_MAX_BATCH * M * K], rounded_b[GEMM_MAX_BATCH * K * N];
+    memcpy(rounded_a, a, (size_t)a_count * sizeof(*a));
+    memcpy(rounded_b, b, (size_t)b_count * sizeof(*b));
+    uint16_t encoded_a[GEMM_MAX_BATCH * M * K], encoded_b[GEMM_MAX_BATCH * K * N];
     if (dtype != GURABO_F32) {
         uint16_t (*encode)(float) = dtype == GURABO_F16 ? gurabo_f16_from_f32 : gurabo_bf16_from_f32;
         float (*decode)(uint16_t) = dtype == GURABO_F16 ? gurabo_f16_to_f32 : gurabo_bf16_to_f32;
-        for (int i = 0; i < M * K; ++i) {
+        for (int i = 0; i < a_count; ++i) {
             encoded_a[i] = encode(a[i]);
             rounded_a[i] = decode(encoded_a[i]);
         }
-        for (int i = 0; i < K * N; ++i) {
+        for (int i = 0; i < b_count; ++i) {
             encoded_b[i] = encode(b[i]);
             rounded_b[i] = decode(encoded_b[i]);
         }
@@ -795,32 +813,47 @@ static double check_matmul(gurabo_context *context, gurabo_stream *stream,
 
     gurabo_buffer *ab = NULL, *bb = NULL, *cb = NULL;
     gurabo_tensor *at = NULL, *bt = NULL, *ct = NULL;
-    gurabo_tensor_desc ashape = trans_a ? matrix_desc(K, M) : matrix_desc(M, K);
-    gurabo_tensor_desc bshape = trans_b ? matrix_desc(N, K) : matrix_desc(K, N);
-    gurabo_tensor_desc cshape = matrix_desc(M, N);
+    gurabo_tensor_desc ashape = batched_matrix_desc(trans_a ? matrix_desc(K, M) : matrix_desc(M, K),
+                                                   a_batches);
+    gurabo_tensor_desc bshape = batched_matrix_desc(trans_b ? matrix_desc(N, K) : matrix_desc(K, N),
+                                                   b_batches);
+    gurabo_tensor_desc cshape = batched_matrix_desc(matrix_desc(M, N), batches);
     ashape.dtype = bshape.dtype = dtype;
     gurabo_matmul_desc config = {GURABO_MATMUL_DESC_SIZE, trans_a, trans_b, -0.75f, beta};
 
-    size_t a_bytes = dtype == GURABO_F32 ? sizeof(a) : sizeof(encoded_a);
-    size_t b_bytes = dtype == GURABO_F32 ? sizeof(b) : sizeof(encoded_b);
+    size_t input_size = dtype == GURABO_F32 ? sizeof(*a) : sizeof(*encoded_a);
+    size_t a_bytes = (size_t)a_count * input_size;
+    size_t b_bytes = (size_t)b_count * input_size;
+    size_t c_bytes = (size_t)c_count * sizeof(*c);
     OK(gurabo_buffer_alloc(context, a_bytes, 0, &ab));
     OK(gurabo_buffer_alloc(context, b_bytes, 0, &bb));
-    OK(gurabo_buffer_alloc(context, sizeof(c), 0, &cb));
+    OK(gurabo_buffer_alloc(context, c_bytes, 0, &cb));
     OK(gurabo_buffer_write(stream, ab, 0, dtype == GURABO_F32 ? (void *)a : encoded_a, a_bytes));
     OK(gurabo_buffer_write(stream, bb, 0, dtype == GURABO_F32 ? (void *)b : encoded_b, b_bytes));
     if (beta != 0) {
-        OK(gurabo_buffer_write(stream, cb, 0, c, sizeof(c)));
+        OK(gurabo_buffer_write(stream, cb, 0, c, c_bytes));
     }
     OK(gurabo_tensor_create(ab, 0, &ashape, &at));
     OK(gurabo_tensor_create(bb, 0, &bshape, &bt));
     OK(gurabo_tensor_create(cb, 0, &cshape, &ct));
 
+    if (batches > 1) {
+        gurabo_tensor *bad_output = NULL;
+        gurabo_tensor_desc bad_shape = batched_matrix_desc(matrix_desc(M, N), 1);
+        OK(gurabo_tensor_create(cb, 0, &bad_shape, &bad_output));
+        STATUS(gurabo_gemm_async(stream, bad_output, at, bt, &config), GURABO_INVALID_ARGUMENT);
+        OK(gurabo_tensor_release(&bad_output));
+    }
     if (dtype == GURABO_F32) {
-        STATUS(gurabo_matmul_async(stream, at, at, bt, &config), GURABO_INVALID_ARGUMENT);
+        if (!batches) {
+            STATUS(gurabo_matmul_async(stream, at, at, bt, &config), GURABO_INVALID_ARGUMENT);
+        }
         OK(gurabo_matmul_async(stream, ct, at, bt, &config));
     } else {
         STATUS(gurabo_matmul_async(stream, ct, at, bt, &config), GURABO_UNSUPPORTED);
-        STATUS(gurabo_gemm_async(stream, at, at, bt, &config), GURABO_UNSUPPORTED);
+        if (!batches) {
+            STATUS(gurabo_gemm_async(stream, at, at, bt, &config), GURABO_UNSUPPORTED);
+        }
         STATUS(gurabo_gemm_async(stream, ct, at, ct, &config), GURABO_UNSUPPORTED);
         OK(gurabo_gemm_async(stream, ct, at, bt, &config));
     }
@@ -829,26 +862,28 @@ static double check_matmul(gurabo_context *context, gurabo_stream *stream,
     OK(gurabo_tensor_release(&ct));
     OK(gurabo_buffer_release(&ab));
     OK(gurabo_buffer_release(&bb));
-    OK(gurabo_buffer_read(stream, actual, cb, 0, sizeof(c)));
+    OK(gurabo_buffer_read(stream, actual, cb, 0, c_bytes));
     OK(gurabo_buffer_release(&cb));
 
     double max_input_rounding = 0;
-    for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
-            int index = i * N + j;
-            double reference = (double)beta * c[index];
-            double full_precision = reference;
-            for (int k = 0; k < K; ++k) {
-                int ai = trans_a ? k * M + i : i * K + k;
-                int bi = trans_b ? j * K + k : k * N + j;
-                reference += (double)config.alpha * rounded_a[ai] * rounded_b[bi];
-                full_precision += (double)config.alpha * a[ai] * b[bi];
-            }
-            CHECK(fabs((double)actual[index] - reference) <= 2e-6 * (1 + fabs(reference)));
-            double input_rounding = fabs(reference - full_precision);
-            if (input_rounding > max_input_rounding) {
-                max_input_rounding = input_rounding;
-            }
+    for (int index = 0; index < c_count; ++index) {
+        int batch = index / (M * N);
+        int i = index / N % M;
+        int j = index % N;
+        int a_start = a_batches > 1 ? batch * M * K : 0;
+        int b_start = b_batches > 1 ? batch * K * N : 0;
+        double reference = (double)beta * c[index];
+        double full_precision = reference;
+        for (int k = 0; k < K; ++k) {
+            int ai = a_start + (trans_a ? k * M + i : i * K + k);
+            int bi = b_start + (trans_b ? j * K + k : k * N + j);
+            reference += (double)config.alpha * rounded_a[ai] * rounded_b[bi];
+            full_precision += (double)config.alpha * a[ai] * b[bi];
+        }
+        CHECK(fabs((double)actual[index] - reference) <= 2e-6 * (1 + fabs(reference)));
+        double input_rounding = fabs(reference - full_precision);
+        if (input_rounding > max_input_rounding) {
+            max_input_rounding = input_rounding;
         }
     }
     return max_input_rounding;
@@ -915,19 +950,34 @@ int main(int argc, char **argv)
         for (uint32_t ta = 0; ta < 2; ++ta) {
             for (uint32_t tb = 0; tb < 2; ++tb) {
                 for (int use_beta = 0; use_beta <= 1; ++use_beta) {
-                    float actual[8];
+                    float actual[GEMM_OUTPUT_SIZE];
                     float beta = use_beta ? 0.5f : 0.0f;
-                    double rounding = check_matmul(context, stream, dtype, ta, tb, beta, actual);
+                    double rounding = check_matmul(context, stream, dtype, ta, tb, beta, 0, 0, actual);
                     if (rounding > max_input_rounding) {
                         max_input_rounding = rounding;
                     }
                     if (cpu_stream) {
-                        float cpu[8];
-                        check_matmul(cpu_context, cpu_stream, dtype, ta, tb, beta, cpu);
+                        float cpu[GEMM_OUTPUT_SIZE];
+                        check_matmul(cpu_context, cpu_stream, dtype, ta, tb, beta, 0, 0, cpu);
                         for (size_t i = 0; i < sizeof(cpu) / sizeof(cpu[0]); ++i) {
                             CHECK(fabsf(actual[i] - cpu[i]) <= 4e-6f * (1 + fabsf(cpu[i])));
                         }
                     }
+                }
+            }
+        }
+        static const uint32_t batch_shapes[][2] = {{2, 2}, {2, 0}, {1, 2}, {0, 2}, {2, 1}, {1, 1}};
+        for (size_t i = 0; i < sizeof(batch_shapes) / sizeof(batch_shapes[0]); ++i) {
+            float actual[GEMM_MAX_BATCH * GEMM_OUTPUT_SIZE];
+            uint32_t a_batches = batch_shapes[i][0], b_batches = batch_shapes[i][1];
+            uint32_t ta = (uint32_t)(i % 2), tb = (uint32_t)(i / 2 % 2);
+            check_matmul(context, stream, dtype, ta, tb, 0.5f, a_batches, b_batches, actual);
+            if (cpu_stream) {
+                float cpu[GEMM_MAX_BATCH * GEMM_OUTPUT_SIZE];
+                check_matmul(cpu_context, cpu_stream, dtype, ta, tb, 0.5f, a_batches, b_batches, cpu);
+                uint32_t batches = a_batches > b_batches ? a_batches : b_batches;
+                for (size_t j = 0; j < batches * GEMM_OUTPUT_SIZE; ++j) {
+                    CHECK(fabsf(actual[j] - cpu[j]) <= 4e-6f * (1 + fabsf(cpu[j])));
                 }
             }
         }

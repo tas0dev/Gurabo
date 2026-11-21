@@ -89,9 +89,8 @@ static float load_f16(const void *buffer, size_t index, gurabo_dtype dtype)
     return dtype == GURABO_F16 ? gurabo_f16_to_f32(bits) : gurabo_bf16_to_f32(bits);
 }
 
-static gb_result cpu_matmul(void *stream, const gb_matmul *args)
+static void cpu_matmul_matrix(const gb_matmul *args)
 {
-    (void)stream;
     size_t m = (size_t)args->m;
     size_t n = (size_t)args->n;
     size_t k = (size_t)args->k;
@@ -124,6 +123,19 @@ static gb_result cpu_matmul(void *stream, const gb_matmul *args)
             }
             memcpy((unsigned char *)args->out + index * sizeof(value), &value, sizeof(value));
         }
+    }
+}
+
+static gb_result cpu_matmul(void *stream, const gb_matmul *args)
+{
+    (void)stream;
+    size_t input_size = args->input_dtype == GURABO_F32 ? sizeof(float) : sizeof(uint16_t);
+    for (size_t batch = 0; batch < (size_t)args->batches; ++batch) {
+        gb_matmul matrix = *args;
+        matrix.a = (const unsigned char *)args->a + batch * (size_t)args->stride_a * input_size;
+        matrix.b = (const unsigned char *)args->b + batch * (size_t)args->stride_b * input_size;
+        matrix.out = args->out + batch * (size_t)args->stride_out;
+        cpu_matmul_matrix(&matrix);
     }
     return gb_status(GURABO_OK);
 }
@@ -227,7 +239,7 @@ const gb_backend gb_cpu = {
                 GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL |
                 GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM |
                 GURABO_FEATURE_ACTIVATION | GURABO_FEATURE_SOFTMAX | GURABO_FEATURE_BINARY_SUB_DIV |
-                GURABO_FEATURE_EMBEDDING,
+                GURABO_FEATURE_EMBEDDING | GURABO_FEATURE_BATCHED_GEMM,
     .device_count = cpu_count,
     .device_info = cpu_info,
     .alloc = cpu_alloc,

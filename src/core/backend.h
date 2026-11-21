@@ -34,6 +34,8 @@ typedef enum {
 typedef struct {
     int32_t m, n, k;
     int32_t a_width, b_width;
+    int32_t batches;
+    int64_t stride_a, stride_b, stride_out;
     uint32_t transpose_a, transpose_b;
     float alpha, beta;
     gurabo_dtype input_dtype;

@@ -170,9 +170,12 @@ static gurabo_status submit_gemm(gurabo_stream *stream, gurabo_tensor *out,
     if (!desc) {
         desc = &defaults;
     }
+    uint32_t a_rank = a->desc.rank;
+    uint32_t b_rank = b->desc.rank;
+    uint32_t out_rank = a_rank > b_rank ? a_rank : b_rank;
     if (desc->struct_size < GURABO_MATMUL_DESC_SIZE || desc->transpose_a > 1 ||
-        desc->transpose_b > 1 || a->desc.rank != 2 || b->desc.rank != 2 ||
-        out->desc.rank != 2) {
+        desc->transpose_b > 1 || a_rank < 2 || b_rank < 2 || out_rank > 3 ||
+        out->desc.rank != out_rank) {
         return gb_fail(GURABO_INVALID_ARGUMENT, backend->id);
     }
     if (out->desc.dtype != GURABO_F32 || !gb_floating_dtype(a->desc.dtype) ||
@@ -181,22 +184,34 @@ static gurabo_status submit_gemm(gurabo_stream *stream, gurabo_tensor *out,
         return gb_fail(GURABO_UNSUPPORTED, backend->id);
     }
 
-    uint64_t m = a->desc.extent[desc->transpose_a];
-    uint64_t k = a->desc.extent[1 - desc->transpose_a];
-    uint64_t n = b->desc.extent[1 - desc->transpose_b];
-    if (!m || !n || !k || k != b->desc.extent[desc->transpose_b] ||
-        m != out->desc.extent[0] || n != out->desc.extent[1] ||
+    const uint64_t *a_matrix = &a->desc.extent[a_rank - 2];
+    const uint64_t *b_matrix = &b->desc.extent[b_rank - 2];
+    const uint64_t *out_matrix = &out->desc.extent[out_rank - 2];
+    uint64_t a_batches = a_rank == 3 ? a->desc.extent[0] : 1;
+    uint64_t b_batches = b_rank == 3 ? b->desc.extent[0] : 1;
+    uint64_t batches = a_batches > b_batches ? a_batches : b_batches;
+    uint64_t m = a_matrix[desc->transpose_a];
+    uint64_t k = a_matrix[1 - desc->transpose_a];
+    uint64_t n = b_matrix[1 - desc->transpose_b];
+    if (!a_batches || !b_batches || (a_batches != b_batches && a_batches != 1 && b_batches != 1) ||
+        (out_rank == 3 && out->desc.extent[0] != batches) ||
+        !m || !n || !k || k != b_matrix[desc->transpose_b] ||
+        m != out_matrix[0] || n != out_matrix[1] ||
         tensors_overlap(out, a) || tensors_overlap(out, b)) {
         return gb_fail(GURABO_INVALID_ARGUMENT, backend->id);
     }
-    if (m > INT32_MAX || n > INT32_MAX || k > INT32_MAX ||
+    if (m > INT32_MAX || n > INT32_MAX || k > INT32_MAX || batches > INT32_MAX ||
         !out->contiguous || !a->contiguous || !b->contiguous) {
         return gb_fail(GURABO_UNSUPPORTED, backend->id);
     }
 
     gb_matmul args = {
         (int32_t)m, (int32_t)n, (int32_t)k,
-        (int32_t)a->desc.extent[1], (int32_t)b->desc.extent[1],
+        (int32_t)a_matrix[1], (int32_t)b_matrix[1],
+        (int32_t)batches,
+        a_batches == 1 ? 0 : (int64_t)(m * k),
+        b_batches == 1 ? 0 : (int64_t)(k * n),
+        (int64_t)(m * n),
         desc->transpose_a, desc->transpose_b, desc->alpha, desc->beta,
         a->desc.dtype,
         gb_buffer_address(a->buffer, a->offset),

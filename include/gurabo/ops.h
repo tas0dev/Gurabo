@@ -16,9 +16,13 @@ typedef struct {
 
 #define GURABO_MATMUL_DESC_SIZE ((uint32_t)sizeof(gurabo_matmul_desc))
 
-/* FP32 row-major out = alpha * op(a) * op(b) + beta * out.
-   NULL desc selects no transposes, alpha = 1, beta = 0. The output must not
-   overlap either input. Success means the work was accepted by the Stream. */
+/* FP32 contiguous row-major out = alpha * op(a) * op(b) + beta * out.
+   Rank-2 inputs produce a rank-2 output. With a rank-3 input, the output
+   shape is [batch, m, n]. The leading input dimensions must match or
+   have extent 1. Rank-2 inputs also broadcast across the batch.
+   All extents must be positive and fit in INT32_MAX. Transpose applies
+   to the last two axes. NULL desc selects no transposes, alpha = 1, beta = 0.
+   The output must not overlap an input. Success means Stream acceptance. */
 gurabo_status gurabo_matmul_async(gurabo_stream *stream, gurabo_tensor *out,
                                   const gurabo_tensor *a, const gurabo_tensor *b,
                                   const gurabo_matmul_desc *desc);

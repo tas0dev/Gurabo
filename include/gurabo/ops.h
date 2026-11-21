@@ -17,11 +17,12 @@ typedef struct {
 #define GURABO_MATMUL_DESC_SIZE ((uint32_t)sizeof(gurabo_matmul_desc))
 
 /* FP32 contiguous row-major out = alpha * op(a) * op(b) + beta * out.
-   Rank-2 inputs produce a rank-2 output. With a rank-3 input, the output
-   shape is [batch, m, n]. The leading input dimensions must match or
-   have extent 1. Rank-2 inputs also broadcast across the batch.
-   All extents must be positive and fit in INT32_MAX. Transpose applies
-   to the last two axes. NULL desc selects no transposes, alpha = 1, beta = 0.
+   Leading batch axes broadcast right-aligned. Matrices occupy the last
+   two axes. Rank-2 inputs broadcast across all batch axes. The output
+   contains the broadcast batch shape followed by [m, n].
+   Matrix extents and the total batch count are positive and fit in INT32_MAX.
+   Transpose applies to the final two axes. NULL desc selects no transposes,
+   alpha = 1 and beta = 0.
    The output must not overlap an input. Success means Stream acceptance. */
 gurabo_status gurabo_matmul_async(gurabo_stream *stream, gurabo_tensor *out,
                                   const gurabo_tensor *a, const gurabo_tensor *b,
@@ -71,10 +72,11 @@ gurabo_status gurabo_binary_async(gurabo_stream *stream, gurabo_binary_op op,
 typedef uint32_t gurabo_reduction;
 enum { GURABO_SUM = 1, GURABO_MEAN = 2, GURABO_MAX = 3 };
 
-/* Sum, mean or maximum over the last axis of a contiguous Tensor, with F32
-   accumulation and output. axis_mask has one bit per axis, starting at bit 0.
-   keep_dims leaves a size-one final axis. An empty axis sums to zero and
-   returns INVALID_ARGUMENT for mean or max. Max propagates NaN. */
+/* Sum, mean or maximum over one or more axes of a contiguous Tensor, with
+   F32 accumulation and output. axis_mask has one bit per axis, starting at
+   bit 0. keep_dims leaves each reduced axis with extent one. A reduced
+   empty axis sums to zero and returns INVALID_ARGUMENT for mean or max.
+   Max propagates NaN. */
 gurabo_status gurabo_reduce_async(gurabo_stream *stream, gurabo_reduction op,
                                   gurabo_tensor *out, const gurabo_tensor *input,
                                   uint32_t axis_mask, uint32_t keep_dims);
@@ -86,6 +88,14 @@ gurabo_status gurabo_reduce_async(gurabo_stream *stream, gurabo_reduction op,
 gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
                                     const gurabo_tensor *input, const gurabo_tensor *scale,
                                     float epsilon);
+
+/* Normalize the last axis using its mean and population variance in F32.
+   Scale and bias are independently optional contiguous vectors over that
+   axis, in F32 or the input dtype. The output matches the input shape and
+   dtype. Exact in-place input/output is allowed. Epsilon is finite and positive. */
+gurabo_status gurabo_layer_norm_async(gurabo_stream *stream, gurabo_tensor *out,
+                                      const gurabo_tensor *input, const gurabo_tensor *scale,
+                                      const gurabo_tensor *bias, float epsilon);
 
 typedef uint32_t gurabo_activation;
 enum { GURABO_SILU = 1, GURABO_RELU = 2, GURABO_GELU = 3 };

@@ -23,6 +23,7 @@
 #define GB_ROW_MAX 3u
 #define GB_ROW_RMS_NORM 4u
 #define GB_ROW_SOFTMAX 5u
+#define GB_ROW_LAYER_NORM 6u
 #define GB_ROW_THREADS 256u
 
 /* This layout is shared by the host and the compiled HIP kernel. */
@@ -49,15 +50,18 @@ typedef struct {
     void *out;
     const void *input;
     const void *scale;
+    const void *bias;
     const unsigned char *mask;
     uint64_t rows;
     uint64_t columns;
     uint64_t extent[GB_POINTWISE_MAX_RANK];
-    uint64_t mask_stride[GB_POINTWISE_MAX_RANK];
+    uint64_t stride[GB_POINTWISE_MAX_RANK];
     uint32_t rank;
     uint32_t op;
     uint32_t input_dtype;
     uint32_t scale_dtype;
+    uint32_t bias_dtype;
+    uint32_t reduced_axes;
     float epsilon;
 } gb_rowwise;
 
@@ -171,14 +175,34 @@ GB_KERNEL_INLINE void gb_store_float(void *base, uint64_t index, uint32_t dtype,
     gb_store_float_bits(base, index, dtype, bits);
 }
 
-GB_KERNEL_INLINE void gb_rms_write(const gb_rowwise *args, uint64_t row_start, uint64_t col,
-                                   float denominator)
+GB_KERNEL_INLINE void gb_norm_write(const gb_rowwise *args, uint64_t row_start, uint64_t col,
+                                    float anchor, float center, float denominator)
 {
-    float value = gb_load_float(args->input, row_start + col, args->input_dtype) / denominator;
+    float value = gb_load_float(args->input, row_start + col, args->input_dtype);
+    if (args->op == GB_ROW_LAYER_NORM) {
+        value = (value - anchor) - center;
+    }
+    value /= denominator;
     if (args->scale) {
         value *= gb_load_float(args->scale, col, args->scale_dtype);
     }
+    if (args->bias) {
+        value += gb_load_float(args->bias, col, args->bias_dtype);
+    }
     gb_store_float(args->out, row_start + col, args->input_dtype, value);
+}
+
+GB_KERNEL_INLINE uint64_t gb_reduction_offset(const gb_rowwise *args, uint64_t index, uint32_t axes)
+{
+    uint64_t offset = 0;
+    for (uint32_t i = args->rank; i > 0; --i) {
+        uint32_t axis = i - 1;
+        if ((axes & (1u << axis)) && args->extent[axis] > 1) {
+            offset += (index % args->extent[axis]) * args->stride[axis];
+            index /= args->extent[axis];
+        }
+    }
+    return offset;
 }
 
 GB_KERNEL_INLINE float gb_float_from_bits(uint32_t bits)
@@ -202,7 +226,7 @@ GB_KERNEL_INLINE uint64_t gb_softmax_mask_base(const gb_rowwise *args, uint64_t 
     if (args->mask) {
         for (uint32_t i = args->rank - 1; i > 0; --i) {
             uint32_t axis = i - 1;
-            offset += (row % args->extent[axis]) * args->mask_stride[axis];
+            offset += (row % args->extent[axis]) * args->stride[axis];
             row /= args->extent[axis];
         }
     }
@@ -211,7 +235,7 @@ GB_KERNEL_INLINE uint64_t gb_softmax_mask_base(const gb_rowwise *args, uint64_t 
 
 GB_KERNEL_INLINE int gb_softmax_keep(const gb_rowwise *args, uint64_t base, uint64_t col)
 {
-    return !args->mask || args->mask[base + col * args->mask_stride[args->rank - 1]] != 0;
+    return !args->mask || args->mask[base + col * args->stride[args->rank - 1]] != 0;
 }
 
 GB_KERNEL_INLINE float gb_softmax_term(float value, float maximum)

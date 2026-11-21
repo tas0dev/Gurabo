@@ -17,8 +17,9 @@ static int overlaps(const gurabo_tensor *out, const gurabo_tensor *input)
            gb_overlap(out->offset, out->span, input->offset, input->span);
 }
 
-static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
-                            const gurabo_tensor *a, const gurabo_tensor *b, const gb_kernel *kernel)
+static gurabo_status submit_kernel(gurabo_stream *stream, gurabo_tensor *out,
+                                   const gurabo_tensor *a, const gurabo_tensor *b,
+                                   const gurabo_tensor *c, const gb_kernel *kernel)
 {
     if (!out->span) {
         return GURABO_OK;
@@ -33,7 +34,8 @@ static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
     gurabo_status status = gb_stream_ready(stream);
     if (status == GURABO_OK && (gb_buffer_unavailable(out->buffer) ||
                                (a && gb_buffer_unavailable(a->buffer)) ||
-                               (b && gb_buffer_unavailable(b->buffer)))) {
+                               (b && gb_buffer_unavailable(b->buffer)) ||
+                               (c && gb_buffer_unavailable(c->buffer)))) {
         status = gb_fail(GURABO_BACKEND_ERROR, backend->id);
     }
     if (status == GURABO_OK && backend->kernel_prepare && !context->kernel_state) {
@@ -57,15 +59,22 @@ static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
             if (job) {
                 job->kernel_completion = completion;
             }
-            gurabo_buffer *buffers[3] = {out->buffer};
+            gurabo_buffer *buffers[4] = {out->buffer};
             uint32_t count = 1;
             if (a) buffers[count++] = a->buffer;
             if (b) buffers[count++] = b->buffer;
+            if (c) buffers[count++] = c->buffer;
             gb_job_end(stream, job, buffers, count, result);
         }
     }
     gb_unlock(&context->gate);
     return status;
+}
+
+static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
+                            const gurabo_tensor *a, const gurabo_tensor *b, const gb_kernel *kernel)
+{
+    return submit_kernel(stream, out, a, b, NULL, kernel);
 }
 
 static uint64_t element_count(const gurabo_tensor *tensor)
@@ -289,33 +298,62 @@ gurabo_status gurabo_reduce_async(gurabo_stream *stream, gurabo_reduction op,
         axis_mask >= (1u << rank) || keep_dims > 1) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
-    uint32_t axis = rank - 1;
-    if (axis_mask != (1u << axis) || out->desc.dtype != GURABO_F32 ||
+    if (out->desc.dtype != GURABO_F32 ||
         !gb_floating_dtype(input->desc.dtype) ||
         !out->contiguous || !input->contiguous) {
         return gb_fail(GURABO_UNSUPPORTED, id);
     }
-    uint64_t columns = input->desc.extent[axis];
-    if (out->desc.rank != axis + keep_dims ||
-        memcmp(out->desc.extent, input->desc.extent, axis * sizeof(out->desc.extent[0])) != 0 ||
-        (keep_dims && out->desc.extent[axis] != 1) ||
-        (op != GURABO_SUM && columns == 0) || overlaps(out, input)) {
+    uint32_t out_axis = 0;
+    int reduced_empty = 0;
+    for (uint32_t axis = 0; axis < rank; ++axis) {
+        uint64_t extent = input->desc.extent[axis];
+        int reduced = (axis_mask & (1u << axis)) != 0;
+        reduced_empty |= reduced && !extent;
+        if (!reduced || keep_dims) {
+            if (out_axis >= out->desc.rank || out->desc.extent[out_axis] != (reduced ? 1 : extent)) {
+                return gb_fail(GURABO_INVALID_ARGUMENT, id);
+            }
+            ++out_axis;
+        }
+    }
+    if (out_axis != out->desc.rank || (op != GURABO_SUM && reduced_empty) || overlaps(out, input)) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
+    uint64_t rows = element_count(out);
+    uint64_t columns = rows ? element_count(input) / rows : 0;
+    uint32_t all_axes = (1u << rank) - 1;
+    int trailing = (axis_mask | (axis_mask - 1)) == all_axes;
     gb_kernel kernel = {.kind = GB_KERNEL_ROWWISE, .args.rowwise = {
         .out = gb_buffer_address(out->buffer, out->offset),
         .input = gb_buffer_address(input->buffer, input->offset),
-        .rows = element_count(out),
+        .rows = rows,
         .columns = columns,
+        .rank = rank,
+        .reduced_axes = trailing ? 0 : axis_mask,
         .op = op,
         .input_dtype = input->desc.dtype
     }};
+    memcpy(kernel.args.rowwise.extent, input->desc.extent, sizeof(input->desc.extent));
+    memcpy(kernel.args.rowwise.stride, input->desc.stride, sizeof(input->desc.stride));
     return submit(stream, out, input, NULL, &kernel);
 }
 
-gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
-                                    const gurabo_tensor *input, const gurabo_tensor *scale,
-                                    float epsilon)
+static int norm_parameter_supported(const gurabo_tensor *parameter, gurabo_dtype dtype)
+{
+    return !parameter || (parameter->contiguous &&
+                          (parameter->desc.dtype == GURABO_F32 || parameter->desc.dtype == dtype));
+}
+
+static int norm_parameter_matches(const gurabo_tensor *parameter, const gurabo_tensor *out,
+                                  uint64_t columns)
+{
+    return !parameter || (parameter->desc.rank == 1 && parameter->desc.extent[0] == columns &&
+                          !overlaps(out, parameter));
+}
+
+static gurabo_status norm_async(gurabo_stream *stream, gurabo_tensor *out,
+                                 const gurabo_tensor *input, const gurabo_tensor *scale,
+                                 const gurabo_tensor *bias, float epsilon, uint32_t op)
 {
     if (!stream || !out || !input) {
         return gb_fail(GURABO_INVALID_HANDLE, 0);
@@ -323,7 +361,7 @@ gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
     gurabo_context *context = stream->context;
     gurabo_backend id = context->backend->id;
     if (out->buffer->context != context || input->buffer->context != context ||
-        (scale && scale->buffer->context != context)) {
+        (scale && scale->buffer->context != context) || (bias && bias->buffer->context != context)) {
         return gb_fail(GURABO_CONTEXT_MISMATCH, id);
     }
     if (!input->desc.rank || !(epsilon > 0.0f) || !isfinite(epsilon) ||
@@ -332,28 +370,43 @@ gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
     }
     if (!gb_floating_dtype(input->desc.dtype) || out->desc.dtype != input->desc.dtype ||
         !out->contiguous || !input->contiguous ||
-        (scale && (!scale->contiguous ||
-                   (scale->desc.dtype != GURABO_F32 && scale->desc.dtype != input->desc.dtype)))) {
+        !norm_parameter_supported(scale, input->desc.dtype) ||
+        !norm_parameter_supported(bias, input->desc.dtype)) {
         return gb_fail(GURABO_UNSUPPORTED, id);
     }
     uint64_t columns = input->desc.extent[input->desc.rank - 1];
     if (!columns || (overlaps(out, input) && out->offset != input->offset) ||
-        (scale && (scale->desc.rank != 1 || scale->desc.extent[0] != columns ||
-                   overlaps(out, scale)))) {
+        !norm_parameter_matches(scale, out, columns) || !norm_parameter_matches(bias, out, columns)) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
     gb_kernel kernel = {.kind = GB_KERNEL_ROWWISE, .args.rowwise = {
         .out = gb_buffer_address(out->buffer, out->offset),
         .input = gb_buffer_address(input->buffer, input->offset),
         .scale = scale ? gb_buffer_address(scale->buffer, scale->offset) : NULL,
+        .bias = bias ? gb_buffer_address(bias->buffer, bias->offset) : NULL,
         .rows = element_count(out) / columns,
         .columns = columns,
-        .op = GB_ROW_RMS_NORM,
+        .op = op,
         .input_dtype = input->desc.dtype,
         .scale_dtype = scale ? scale->desc.dtype : 0,
+        .bias_dtype = bias ? bias->desc.dtype : 0,
         .epsilon = epsilon
     }};
-    return submit(stream, out, input, scale, &kernel);
+    return submit_kernel(stream, out, input, scale, bias, &kernel);
+}
+
+gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
+                                    const gurabo_tensor *input, const gurabo_tensor *scale,
+                                    float epsilon)
+{
+    return norm_async(stream, out, input, scale, NULL, epsilon, GB_ROW_RMS_NORM);
+}
+
+gurabo_status gurabo_layer_norm_async(gurabo_stream *stream, gurabo_tensor *out,
+                                      const gurabo_tensor *input, const gurabo_tensor *scale,
+                                      const gurabo_tensor *bias, float epsilon)
+{
+    return norm_async(stream, out, input, scale, bias, epsilon, GB_ROW_LAYER_NORM);
 }
 
 gurabo_status gurabo_activation_async(gurabo_stream *stream, gurabo_activation op,
@@ -392,7 +445,7 @@ static int make_softmax_mask(gb_rowwise *args, const gurabo_tensor_desc *input,
         if (n != 1 && n != input->extent[axis]) {
             return 0;
         }
-        args->mask_stride[axis] = n == 1 ? 0 : mask->stride[axis - pad];
+        args->stride[axis] = n == 1 ? 0 : mask->stride[axis - pad];
     }
     return 1;
 }

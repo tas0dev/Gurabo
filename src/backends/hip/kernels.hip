@@ -66,6 +66,26 @@ static __device__ void softmax_row(const gb_rowwise *args, uint64_t row, float *
     }
 }
 
+static __device__ void layer_norm_row(const gb_rowwise *args, uint64_t start, float *partial)
+{
+    float anchor = gb_load_float(args->input, start, args->input_dtype);
+    float center = 0.0f;
+    for (uint64_t col = threadIdx.x; col < args->columns; col += blockDim.x) {
+        center += gb_load_float(args->input, start + col, args->input_dtype) - anchor;
+    }
+    center = block_reduce(partial, center, false) / (float)args->columns;
+    float variance = 0.0f;
+    for (uint64_t col = threadIdx.x; col < args->columns; col += blockDim.x) {
+        float delta = (gb_load_float(args->input, start + col, args->input_dtype) - anchor) - center;
+        variance += delta * delta;
+    }
+    variance = block_reduce(partial, variance, false) / (float)args->columns;
+    float denominator = __builtin_sqrtf(variance + args->epsilon);
+    for (uint64_t col = threadIdx.x; col < args->columns; col += blockDim.x) {
+        gb_norm_write(args, start, col, anchor, center, denominator);
+    }
+}
+
 extern "C" __global__ void gurabo_rowwise(gb_rowwise args)
 {
     __shared__ float partial[GB_ROW_THREADS];
@@ -78,16 +98,24 @@ extern "C" __global__ void gurabo_rowwise(gb_rowwise args)
             continue;
         }
         uint64_t start = row * args.columns;
+        if (args.op == GB_ROW_LAYER_NORM) {
+            layer_norm_row(&args, start, partial);
+            continue;
+        }
+        if (args.reduced_axes && args.columns) {
+            start = gb_reduction_offset(&args, row, ~args.reduced_axes);
+        }
         float sum = max ? gb_float_from_bits(0xFF800000u) : 0.0f;
         for (uint64_t col = tid; col < args.columns; col += blockDim.x) {
-            float value = gb_load_float(args.input, start + col, args.input_dtype);
+            uint64_t offset = args.reduced_axes ? gb_reduction_offset(&args, col, args.reduced_axes) : col;
+            float value = gb_load_float(args.input, start + offset, args.input_dtype);
             sum = max ? gb_max_float(sum, value) : sum + (rms ? value * value : value);
         }
         sum = block_reduce(partial, sum, max);
         if (rms) {
             float denominator = __builtin_sqrtf(sum / (float)args.columns + args.epsilon);
             for (uint64_t col = tid; col < args.columns; col += blockDim.x) {
-                gb_rms_write(&args, start, col, denominator);
+                gb_norm_write(&args, start, col, 0.0f, 0.0f, denominator);
             }
         } else if (tid == 0) {
             float value = args.op == GB_ROW_MEAN ? sum / (float)args.columns : sum;

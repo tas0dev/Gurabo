@@ -166,6 +166,26 @@ static void cpu_softmax_row(const gb_rowwise *args, uint64_t row)
     }
 }
 
+static void cpu_layer_norm_row(const gb_rowwise *args, uint64_t start)
+{
+    float anchor = gb_load_float(args->input, start, args->input_dtype);
+    float shifts[4] = {0};
+    for (uint64_t col = 0; col < args->columns; ++col) {
+        shifts[col % 4] += gb_load_float(args->input, start + col, args->input_dtype) - anchor;
+    }
+    float center = ((shifts[0] + shifts[1]) + (shifts[2] + shifts[3])) / (float)args->columns;
+    float squares[4] = {0};
+    for (uint64_t col = 0; col < args->columns; ++col) {
+        float delta = (gb_load_float(args->input, start + col, args->input_dtype) - anchor) - center;
+        squares[col % 4] += delta * delta;
+    }
+    float variance = ((squares[0] + squares[1]) + (squares[2] + squares[3])) / (float)args->columns;
+    float denominator = sqrtf(variance + args->epsilon);
+    for (uint64_t col = 0; col < args->columns; ++col) {
+        gb_norm_write(args, start, col, anchor, center, denominator);
+    }
+}
+
 static void cpu_rowwise(const gb_rowwise *args)
 {
     int rms = args->op == GB_ROW_RMS_NORM;
@@ -176,15 +196,23 @@ static void cpu_rowwise(const gb_rowwise *args)
             continue;
         }
         uint64_t start = row * args->columns;
+        if (args->op == GB_ROW_LAYER_NORM) {
+            cpu_layer_norm_row(args, start);
+            continue;
+        }
+        if (args->reduced_axes && args->columns) {
+            start = gb_reduction_offset(args, row, ~args->reduced_axes);
+        }
         float sum = max ? gb_float_from_bits(0xFF800000u) : 0.0f;
         for (uint64_t col = 0; col < args->columns; ++col) {
-            float value = gb_load_float(args->input, start + col, args->input_dtype);
+            uint64_t offset = args->reduced_axes ? gb_reduction_offset(args, col, args->reduced_axes) : col;
+            float value = gb_load_float(args->input, start + offset, args->input_dtype);
             sum = max ? gb_max_float(sum, value) : sum + (rms ? value * value : value);
         }
         if (rms) {
             float denominator = sqrtf(sum / (float)args->columns + args->epsilon);
             for (uint64_t col = 0; col < args->columns; ++col) {
-                gb_rms_write(args, start, col, denominator);
+                gb_norm_write(args, start, col, 0.0f, 0.0f, denominator);
             }
         } else {
             float value = args->op == GB_ROW_MEAN ? sum / (float)args->columns : sum;
@@ -240,7 +268,8 @@ const gb_backend gb_cpu = {
                 GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM |
                 GURABO_FEATURE_ACTIVATION | GURABO_FEATURE_SOFTMAX | GURABO_FEATURE_BINARY_SUB_DIV |
                 GURABO_FEATURE_EMBEDDING | GURABO_FEATURE_BATCHED_GEMM |
-                GURABO_FEATURE_AXPBY | GURABO_FEATURE_TENSOR_COPY | GURABO_FEATURE_TENSOR_INIT,
+                GURABO_FEATURE_AXPBY | GURABO_FEATURE_TENSOR_COPY | GURABO_FEATURE_TENSOR_INIT |
+                GURABO_FEATURE_AXIS_REDUCTION | GURABO_FEATURE_LAYER_NORM | GURABO_FEATURE_MULTI_AXIS_GEMM,
     .device_count = cpu_count,
     .device_info = cpu_info,
     .alloc = cpu_alloc,

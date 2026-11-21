@@ -44,6 +44,9 @@ typedef struct {
 #define GURABO_FEATURE_AXPBY (UINT64_C(1) << 14)
 #define GURABO_FEATURE_TENSOR_COPY (UINT64_C(1) << 15)
 #define GURABO_FEATURE_TENSOR_INIT (UINT64_C(1) << 16)
+#define GURABO_FEATURE_AXIS_REDUCTION (UINT64_C(1) << 17)
+#define GURABO_FEATURE_LAYER_NORM (UINT64_C(1) << 18)
+#define GURABO_FEATURE_MULTI_AXIS_GEMM (UINT64_C(1) << 19)
 
 gurabo_status gurabo_backend_count(uint32_t *out);
 gurabo_status gurabo_backend_at(uint32_t index, gurabo_backend *out);

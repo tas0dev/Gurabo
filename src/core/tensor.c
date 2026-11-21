@@ -232,6 +232,92 @@ static int tensors_overlap(const gurabo_tensor *a, const gurabo_tensor *b)
     return a->buffer == b->buffer && gb_overlap(a->offset, a->span, b->offset, b->span);
 }
 
+typedef struct {
+    uint64_t extent[GURABO_MAX_RANK - 2];
+    uint64_t a_stride[GURABO_MAX_RANK - 2];
+    uint64_t b_stride[GURABO_MAX_RANK - 2];
+    uint64_t total, inner;
+    uint32_t outer_rank;
+} gemm_batches;
+
+static gurabo_status gemm_batch_layout(gemm_batches *batch, gb_matmul *args,
+                                       const gurabo_tensor_desc *out, const gurabo_tensor_desc *a,
+                                       const gurabo_tensor_desc *b)
+{
+    uint32_t rank = out->rank - 2;
+    uint32_t a_pad = out->rank - a->rank;
+    uint32_t b_pad = out->rank - b->rank;
+    batch->total = 1;
+    for (uint32_t i = 0; i < rank; ++i) {
+        uint64_t an = i < a_pad ? 1 : a->extent[i - a_pad];
+        uint64_t bn = i < b_pad ? 1 : b->extent[i - b_pad];
+        uint64_t n = an == 1 ? bn : an;
+        if (!an || !bn || (an != bn && an != 1 && bn != 1) || out->extent[i] != n) {
+            return GURABO_INVALID_ARGUMENT;
+        }
+        if (n > INT32_MAX / batch->total) {
+            return GURABO_UNSUPPORTED;
+        }
+        batch->extent[i] = n;
+        batch->a_stride[i] = an == 1 ? 0 : a->stride[i - a_pad];
+        batch->b_stride[i] = bn == 1 ? 0 : b->stride[i - b_pad];
+        batch->total *= n;
+    }
+
+    /* Group the largest suffix with constant per-matrix strides. */
+    uint64_t stride_a = 0, stride_b = 0;
+    batch->inner = 1;
+    batch->outer_rank = rank;
+    while (batch->outer_rank) {
+        uint32_t i = batch->outer_rank - 1;
+        if (batch->extent[i] > 1) {
+            uint64_t sa = batch->a_stride[i], sb = batch->b_stride[i];
+            if (batch->inner == 1) {
+                stride_a = sa;
+                stride_b = sb;
+            } else if (sa % batch->inner || sb % batch->inner ||
+                       sa / batch->inner != stride_a || sb / batch->inner != stride_b) {
+                break;
+            }
+            batch->inner *= batch->extent[i];
+        }
+        --batch->outer_rank;
+    }
+    args->batches = (int32_t)batch->inner;
+    args->stride_a = (int64_t)stride_a;
+    args->stride_b = (int64_t)stride_b;
+    return GURABO_OK;
+}
+
+static gb_result dispatch_gemm(gurabo_stream *stream, const gb_matmul *args,
+                               const gemm_batches *batch)
+{
+    const gb_backend *backend = stream->context->backend;
+    if (!batch->outer_rank) {
+        return backend->matmul(stream->native, args);
+    }
+    size_t input_bytes = gb_dtype_size(args->input_dtype);
+    for (uint64_t group = 0; group < batch->total / batch->inner; ++group) {
+        uint64_t index = group, a_offset = 0, b_offset = 0;
+        for (uint32_t i = batch->outer_rank; i > 0; --i) {
+            uint32_t axis = i - 1;
+            uint64_t coordinate = index % batch->extent[axis];
+            index /= batch->extent[axis];
+            a_offset += coordinate * batch->a_stride[axis];
+            b_offset += coordinate * batch->b_stride[axis];
+        }
+        gb_matmul matrix = *args;
+        matrix.a = (const unsigned char *)args->a + a_offset * input_bytes;
+        matrix.b = (const unsigned char *)args->b + b_offset * input_bytes;
+        matrix.out = args->out + group * batch->inner * (uint64_t)args->stride_out;
+        gb_result result = backend->matmul(stream->native, &matrix);
+        if (result.status != GURABO_OK) {
+            return result;
+        }
+    }
+    return gb_status(GURABO_OK);
+}
+
 static gurabo_status submit_gemm(gurabo_stream *stream, gurabo_tensor *out,
                                  const gurabo_tensor *a, const gurabo_tensor *b,
                                  const gurabo_matmul_desc *desc, int allow_mixed)
@@ -253,7 +339,7 @@ static gurabo_status submit_gemm(gurabo_stream *stream, gurabo_tensor *out,
     uint32_t b_rank = b->desc.rank;
     uint32_t out_rank = a_rank > b_rank ? a_rank : b_rank;
     if (desc->struct_size < GURABO_MATMUL_DESC_SIZE || desc->transpose_a > 1 ||
-        desc->transpose_b > 1 || a_rank < 2 || b_rank < 2 || out_rank > 3 ||
+        desc->transpose_b > 1 || a_rank < 2 || b_rank < 2 ||
         out->desc.rank != out_rank) {
         return gb_fail(GURABO_INVALID_ARGUMENT, backend->id);
     }
@@ -266,39 +352,37 @@ static gurabo_status submit_gemm(gurabo_stream *stream, gurabo_tensor *out,
     const uint64_t *a_matrix = &a->desc.extent[a_rank - 2];
     const uint64_t *b_matrix = &b->desc.extent[b_rank - 2];
     const uint64_t *out_matrix = &out->desc.extent[out_rank - 2];
-    uint64_t a_batches = a_rank == 3 ? a->desc.extent[0] : 1;
-    uint64_t b_batches = b_rank == 3 ? b->desc.extent[0] : 1;
-    uint64_t batches = a_batches > b_batches ? a_batches : b_batches;
     uint64_t m = a_matrix[desc->transpose_a];
     uint64_t k = a_matrix[1 - desc->transpose_a];
     uint64_t n = b_matrix[1 - desc->transpose_b];
-    if (!a_batches || !b_batches || (a_batches != b_batches && a_batches != 1 && b_batches != 1) ||
-        (out_rank == 3 && out->desc.extent[0] != batches) ||
-        !m || !n || !k || k != b_matrix[desc->transpose_b] ||
+    if (!m || !n || !k || k != b_matrix[desc->transpose_b] ||
         m != out_matrix[0] || n != out_matrix[1] ||
         tensors_overlap(out, a) || tensors_overlap(out, b)) {
         return gb_fail(GURABO_INVALID_ARGUMENT, backend->id);
     }
-    if (m > INT32_MAX || n > INT32_MAX || k > INT32_MAX || batches > INT32_MAX ||
+    if (m > INT32_MAX || n > INT32_MAX || k > INT32_MAX ||
         !out->contiguous || !a->contiguous || !b->contiguous) {
         return gb_fail(GURABO_UNSUPPORTED, backend->id);
     }
 
     gb_matmul args = {
-        (int32_t)m, (int32_t)n, (int32_t)k,
-        (int32_t)a_matrix[1], (int32_t)b_matrix[1],
-        (int32_t)batches,
-        a_batches == 1 ? 0 : (int64_t)(m * k),
-        b_batches == 1 ? 0 : (int64_t)(k * n),
-        (int64_t)(m * n),
-        desc->transpose_a, desc->transpose_b, desc->alpha, desc->beta,
-        a->desc.dtype,
-        gb_buffer_address(a->buffer, a->offset),
-        gb_buffer_address(b->buffer, b->offset),
-        gb_buffer_address(out->buffer, out->offset)
+        .m = (int32_t)m, .n = (int32_t)n, .k = (int32_t)k,
+        .a_width = (int32_t)a_matrix[1], .b_width = (int32_t)b_matrix[1],
+        .stride_out = (int64_t)(m * n),
+        .transpose_a = desc->transpose_a, .transpose_b = desc->transpose_b,
+        .alpha = desc->alpha, .beta = desc->beta,
+        .input_dtype = a->desc.dtype,
+        .a = gb_buffer_address(a->buffer, a->offset),
+        .b = gb_buffer_address(b->buffer, b->offset),
+        .out = gb_buffer_address(out->buffer, out->offset)
     };
+    gemm_batches batch;
+    gurabo_status status = gemm_batch_layout(&batch, &args, &out->desc, &a->desc, &b->desc);
+    if (status != GURABO_OK) {
+        return gb_fail(status, backend->id);
+    }
     gb_lock(&context->gate);
-    gurabo_status status = gb_stream_ready(stream);
+    status = gb_stream_ready(stream);
     if (status == GURABO_OK && (gb_buffer_unavailable(out->buffer) ||
                                gb_buffer_unavailable(a->buffer) ||
                                gb_buffer_unavailable(b->buffer))) {
@@ -308,7 +392,7 @@ static gurabo_status submit_gemm(gurabo_stream *stream, gurabo_tensor *out,
         gb_job *job;
         status = gb_job_begin(stream, &job);
         if (status == GURABO_OK) {
-            gb_result result = backend->matmul(stream->native, &args);
+            gb_result result = dispatch_gemm(stream, &args, &batch);
             gurabo_buffer *buffers[] = {out->buffer, a->buffer, b->buffer};
             gb_job_end(stream, job, buffers, 3, result);
         }

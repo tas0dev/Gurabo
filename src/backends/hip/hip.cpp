@@ -75,10 +75,18 @@ private:
     bool changed = false;
 };
 
+struct embedding_result {
+    embedding_result *next = nullptr;
+    unsigned *host = nullptr;
+    unsigned *device = nullptr;
+};
+
 struct kernel_module {
     hipModule_t module = nullptr;
     hipFunction_t pointwise = nullptr;
     hipFunction_t rowwise = nullptr;
+    hipFunction_t embedding = nullptr;
+    embedding_result *available_results = nullptr;
 };
 
 gb_result hiprtc_result(hiprtcResult error, hiprtcProgram program)
@@ -154,6 +162,9 @@ gb_result kernel_prepare(uint32_t ordinal, void **state)
         if (error == hipSuccess) {
             error = hipModuleGetFunction(&module->rowwise, module->module, "gurabo_rowwise");
         }
+        if (error == hipSuccess) {
+            error = hipModuleGetFunction(&module->embedding, module->module, "gurabo_embedding");
+        }
         if (error != hipSuccess) {
             (void)hipModuleUnload(module->module);
         }
@@ -168,10 +179,59 @@ gb_result kernel_release(uint32_t ordinal, void *state)
 {
     auto module = std::unique_ptr<kernel_module>(static_cast<kernel_module *>(state));
     device_scope device(ordinal);
-    return hip_result(device.error == hipSuccess ? hipModuleUnload(module->module) : device.error);
+    hipError_t first = device.error == hipSuccess ? hipModuleUnload(module->module) : device.error;
+    while (module->available_results) {
+        auto result = std::unique_ptr<embedding_result>(module->available_results);
+        module->available_results = result->next;
+        if (device.error == hipSuccess) {
+            hipError_t free_device = hipFree(result->device);
+            hipError_t free_host = hipFreeHost(result->host);
+            if (first == hipSuccess) {
+                first = free_device != hipSuccess ? free_device : free_host;
+            }
+        }
+    }
+    return hip_result(first);
 }
 
-gb_result kernel_launch(void *stream, void *state, const gb_kernel *kernel)
+gb_result take_embedding_result(kernel_module *module, embedding_result **out)
+{
+    if (module->available_results) {
+        *out = module->available_results;
+        module->available_results = (*out)->next;
+        return gb_status(GURABO_OK);
+    }
+    auto result = std::unique_ptr<embedding_result>(new (std::nothrow) embedding_result);
+    if (!result) {
+        return gb_status(GURABO_OUT_OF_MEMORY);
+    }
+    void *host = nullptr;
+    hipError_t error = hipHostMalloc(&host, sizeof(unsigned), hipHostMallocDefault);
+    if (error == hipSuccess) {
+        void *device = nullptr;
+        error = hipMalloc(&device, sizeof(unsigned));
+        if (error == hipSuccess) {
+            result->host = static_cast<unsigned *>(host);
+            result->device = static_cast<unsigned *>(device);
+            *out = result.release();
+        } else {
+            (void)hipFreeHost(host);
+        }
+    }
+    return hip_result(error);
+}
+
+gb_result kernel_complete(void *state, void *completion)
+{
+    auto *module = static_cast<kernel_module *>(state);
+    auto *result = static_cast<embedding_result *>(completion);
+    unsigned invalid = *result->host;
+    result->next = module->available_results;
+    module->available_results = result;
+    return gb_status(invalid ? GURABO_OUT_OF_RANGE : GURABO_OK);
+}
+
+gb_result kernel_launch(void *stream, void *state, const gb_kernel *kernel, void **completion)
 {
     auto *native = static_cast<hip_stream *>(stream);
     auto *module = static_cast<kernel_module *>(state);
@@ -185,7 +245,24 @@ gb_result kernel_launch(void *stream, void *state, const gb_kernel *kernel)
     hipFunction_t function;
     uint64_t blocks;
     void *kernel_args[1];
-    if (kernel->kind == GB_KERNEL_ROWWISE) {
+    embedding_result *result = nullptr;
+    if (kernel->kind == GB_KERNEL_EMBEDDING) {
+        auto &args = parameters.args.embedding;
+        gb_result acquired = take_embedding_result(module, &result);
+        if (acquired.status != GURABO_OK) {
+            return acquired;
+        }
+        *completion = result;
+        *result->host = 0;
+        args.invalid_index = result->device;
+        hipError_t error = hipMemsetAsync(result->device, 0, sizeof(unsigned), native->stream);
+        if (error != hipSuccess) {
+            return hip_result(error);
+        }
+        blocks = args.index_count;
+        function = module->embedding;
+        kernel_args[0] = &args;
+    } else if (kernel->kind == GB_KERNEL_ROWWISE) {
         const gb_rowwise &args = kernel->args.rowwise;
         threads = 32;
         while (threads < args.columns && threads < GB_ROW_THREADS) {
@@ -200,8 +277,13 @@ gb_result kernel_launch(void *stream, void *state, const gb_kernel *kernel)
         kernel_args[0] = &parameters.args.pointwise;
     }
     unsigned grid = blocks < max_blocks ? static_cast<unsigned>(blocks) : max_blocks;
-    return hip_result(hipModuleLaunchKernel(function, grid, 1, 1, threads, 1, 1,
-                                           0, native->stream, kernel_args, nullptr));
+    hipError_t error = hipModuleLaunchKernel(function, grid, 1, 1, threads, 1, 1,
+                                            0, native->stream, kernel_args, nullptr);
+    if (error == hipSuccess && result) {
+        error = hipMemcpyAsync(result->host, result->device, sizeof(unsigned),
+                               hipMemcpyDeviceToHost, native->stream);
+    }
+    return hip_result(error);
 }
 
 gb_result count_devices(uint32_t *out)
@@ -483,7 +565,9 @@ const gb_backend gb_hip = {
     GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_PINNED_HOST_MEMORY |
         GURABO_FEATURE_F16_GEMM | GURABO_FEATURE_BF16_GEMM |
         GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL |
-        GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM,
+        GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM |
+        GURABO_FEATURE_ACTIVATION | GURABO_FEATURE_SOFTMAX | GURABO_FEATURE_BINARY_SUB_DIV |
+        GURABO_FEATURE_EMBEDDING,
     count_devices,
     device_info,
     alloc,
@@ -502,5 +586,6 @@ const gb_backend gb_hip = {
     matmul,
     kernel_prepare,
     kernel_release,
-    kernel_launch
+    kernel_launch,
+    kernel_complete
 };

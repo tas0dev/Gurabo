@@ -128,15 +128,46 @@ static gb_result cpu_matmul(void *stream, const gb_matmul *args)
     return gb_status(GURABO_OK);
 }
 
+static void cpu_softmax_row(const gb_rowwise *args, uint64_t row)
+{
+    uint64_t start = row * args->columns;
+    uint64_t mask = gb_softmax_mask_base(args, row);
+    float maximum = gb_float_from_bits(0xFF800000u);
+    for (uint64_t col = 0; col < args->columns; ++col) {
+        if (gb_softmax_keep(args, mask, col)) {
+            maximum = gb_max_float(maximum, gb_load_float(args->input, start + col, args->input_dtype));
+        }
+    }
+    float sum = 0.0f;
+    for (uint64_t col = 0; col < args->columns; ++col) {
+        if (gb_softmax_keep(args, mask, col)) {
+            sum += gb_softmax_term(gb_load_float(args->input, start + col, args->input_dtype), maximum);
+        }
+    }
+    for (uint64_t col = 0; col < args->columns; ++col) {
+        float value = 0.0f;
+        if (sum != 0.0f && gb_softmax_keep(args, mask, col)) {
+            value = gb_softmax_term(gb_load_float(args->input, start + col, args->input_dtype),
+                                    maximum) / sum;
+        }
+        gb_store_float(args->out, start + col, args->input_dtype, value);
+    }
+}
+
 static void cpu_rowwise(const gb_rowwise *args)
 {
     int rms = args->op == GB_ROW_RMS_NORM;
+    int max = args->op == GB_ROW_MAX;
     for (uint64_t row = 0; row < args->rows; ++row) {
+        if (args->op == GB_ROW_SOFTMAX) {
+            cpu_softmax_row(args, row);
+            continue;
+        }
         uint64_t start = row * args->columns;
-        float sum = 0.0f;
+        float sum = max ? gb_float_from_bits(0xFF800000u) : 0.0f;
         for (uint64_t col = 0; col < args->columns; ++col) {
             float value = gb_load_float(args->input, start + col, args->input_dtype);
-            sum += rms ? value * value : value;
+            sum = max ? gb_max_float(sum, value) : sum + (rms ? value * value : value);
         }
         if (rms) {
             float denominator = sqrtf(sum / (float)args->columns + args->epsilon);
@@ -150,10 +181,34 @@ static void cpu_rowwise(const gb_rowwise *args)
     }
 }
 
-static gb_result cpu_kernel_launch(void *stream, void *state, const gb_kernel *kernel)
+static gb_result cpu_embedding(const gb_embedding *args)
+{
+    int invalid = 0;
+    size_t row_bytes = (size_t)(args->width * args->element_bytes);
+    unsigned char *out = args->out;
+    const unsigned char *table = args->table;
+    for (uint64_t i = 0; i < args->index_count; ++i) {
+        int64_t index = gb_embedding_index(args, i);
+        unsigned char *row = out + i * row_bytes;
+        if (index < 0 || (uint64_t)index >= args->vocabulary) {
+            memset(row, 0, row_bytes);
+            invalid = 1;
+        } else {
+            memcpy(row, table + (uint64_t)index * row_bytes, row_bytes);
+        }
+    }
+    return gb_status(invalid ? GURABO_OUT_OF_RANGE : GURABO_OK);
+}
+
+static gb_result cpu_kernel_launch(void *stream, void *state, const gb_kernel *kernel,
+                                    void **completion)
 {
     (void)stream;
     (void)state;
+    (void)completion;
+    if (kernel->kind == GB_KERNEL_EMBEDDING) {
+        return cpu_embedding(&kernel->args.embedding);
+    }
     if (kernel->kind == GB_KERNEL_ROWWISE) {
         cpu_rowwise(&kernel->args.rowwise);
     } else {
@@ -170,7 +225,9 @@ const gb_backend gb_cpu = {
     .alignment = 64,
     .features = GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_F16_GEMM | GURABO_FEATURE_BF16_GEMM |
                 GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL |
-                GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM,
+                GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM |
+                GURABO_FEATURE_ACTIVATION | GURABO_FEATURE_SOFTMAX | GURABO_FEATURE_BINARY_SUB_DIV |
+                GURABO_FEATURE_EMBEDDING,
     .device_count = cpu_count,
     .device_info = cpu_info,
     .alloc = cpu_alloc,

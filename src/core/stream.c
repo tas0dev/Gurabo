@@ -75,6 +75,11 @@ static void retire_job(gurabo_stream *stream, int safe, int defer_buffer_free)
     if (!safe && job->uses_kernel_module) {
         context->kernel_in_doubt = 1;
     }
+    if (safe && job->kernel_completion) {
+        gb_result result = context->backend->kernel_complete(context->kernel_state,
+                                                              job->kernel_completion);
+        remember(stream, result, GURABO_ERROR_EXECUTION, job->id);
+    }
     if (job->dependency) {
         gurabo_event *dependency = job->dependency;
         if (safe) {

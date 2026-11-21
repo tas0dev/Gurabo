@@ -10,10 +10,12 @@ endif()
 
 if(GURABO_ENABLE_CPU)
     add_test(NAME gurabo.cpu COMMAND gurabo_api_test cpu)
+    add_test(NAME gurabo.inference_cpu COMMAND gurabo_inference cpu)
 endif()
 if(GURABO_ENABLE_HIP)
     add_test(NAME gurabo.hip COMMAND gurabo_api_test hip)
-    set_tests_properties(gurabo.hip PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME gurabo.inference_hip COMMAND gurabo_inference hip)
+    set_tests_properties(gurabo.hip gurabo.inference_hip PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 include(CheckLanguage)

@@ -4,9 +4,11 @@
 _Static_assert(GB_POINTWISE_MAX_RANK == GURABO_MAX_RANK, "Pointwise rank must match Tensor rank");
 _Static_assert(GB_POINTWISE_F32 == GURABO_F32 && GB_POINTWISE_F16 == GURABO_F16 &&
                GB_POINTWISE_BF16 == GURABO_BF16, "Pointwise dtypes must match public dtypes");
-_Static_assert(GB_POINTWISE_ADD == GURABO_ADD && GB_POINTWISE_MUL == GURABO_MUL,
+_Static_assert(GB_POINTWISE_ADD == GURABO_ADD && GB_POINTWISE_MUL == GURABO_MUL &&
+               GB_POINTWISE_SUB == GURABO_SUB && GB_POINTWISE_DIV == GURABO_DIV,
                "Pointwise operations must match public operations");
-_Static_assert(GB_ROW_SUM == GURABO_SUM && GB_ROW_MEAN == GURABO_MEAN,
+_Static_assert(GB_ROW_SUM == GURABO_SUM && GB_ROW_MEAN == GURABO_MEAN &&
+               GB_ROW_MAX == GURABO_MAX,
                "Reduction operations must match public operations");
 
 static int overlaps(const gurabo_tensor *out, const gurabo_tensor *input)
@@ -49,7 +51,12 @@ static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
             if (job) {
                 job->uses_kernel_module = context->kernel_state != NULL;
             }
-            gb_result result = backend->kernel_launch(stream->native, context->kernel_state, kernel);
+            void *completion = NULL;
+            gb_result result = backend->kernel_launch(stream->native, context->kernel_state,
+                                                       kernel, &completion);
+            if (job) {
+                job->kernel_completion = completion;
+            }
             gurabo_buffer *buffers[] = {out->buffer, a->buffer, b ? b->buffer : NULL};
             gb_job_end(stream, job, buffers, b ? 3 : 2, result);
         }
@@ -60,7 +67,7 @@ static gurabo_status submit(gurabo_stream *stream, gurabo_tensor *out,
 
 static uint64_t element_count(const gurabo_tensor *tensor)
 {
-    return tensor->span / (tensor->desc.dtype == GURABO_F32 ? sizeof(float) : sizeof(uint16_t));
+    return tensor->span / gb_dtype_size(tensor->desc.dtype);
 }
 
 static gurabo_status submit_pointwise(gurabo_stream *stream, gurabo_tensor *out,
@@ -98,6 +105,7 @@ gurabo_status gurabo_tensor_cast_async(gurabo_stream *stream, gurabo_tensor *out
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
     if (!out->contiguous || !input->contiguous ||
+        !gb_floating_dtype(out->desc.dtype) || !gb_floating_dtype(input->desc.dtype) ||
         (out->desc.dtype == GURABO_F32) == (input->desc.dtype == GURABO_F32)) {
         return gb_fail(GURABO_UNSUPPORTED, id);
     }
@@ -145,10 +153,11 @@ gurabo_status gurabo_binary_async(gurabo_stream *stream, gurabo_binary_op op,
         b->buffer->context != context) {
         return gb_fail(GURABO_CONTEXT_MISMATCH, id);
     }
-    if (op != GURABO_ADD && op != GURABO_MUL) {
+    if (op < GURABO_ADD || op > GURABO_DIV) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
-    if (out->desc.dtype != a->desc.dtype || out->desc.dtype != b->desc.dtype ||
+    if (!gb_floating_dtype(out->desc.dtype) ||
+        out->desc.dtype != a->desc.dtype || out->desc.dtype != b->desc.dtype ||
         !out->contiguous || !a->contiguous || !b->contiguous) {
         return gb_fail(GURABO_UNSUPPORTED, id);
     }
@@ -174,12 +183,13 @@ gurabo_status gurabo_reduce_async(gurabo_stream *stream, gurabo_reduction op,
         return gb_fail(GURABO_CONTEXT_MISMATCH, id);
     }
     uint32_t rank = input->desc.rank;
-    if ((op != GURABO_SUM && op != GURABO_MEAN) || !rank || !axis_mask ||
+    if (op < GURABO_SUM || op > GURABO_MAX || !rank || !axis_mask ||
         axis_mask >= (1u << rank) || keep_dims > 1) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
     uint32_t axis = rank - 1;
     if (axis_mask != (1u << axis) || out->desc.dtype != GURABO_F32 ||
+        !gb_floating_dtype(input->desc.dtype) ||
         !out->contiguous || !input->contiguous) {
         return gb_fail(GURABO_UNSUPPORTED, id);
     }
@@ -187,7 +197,7 @@ gurabo_status gurabo_reduce_async(gurabo_stream *stream, gurabo_reduction op,
     if (out->desc.rank != axis + keep_dims ||
         memcmp(out->desc.extent, input->desc.extent, axis * sizeof(out->desc.extent[0])) != 0 ||
         (keep_dims && out->desc.extent[axis] != 1) ||
-        (op == GURABO_MEAN && columns == 0) || overlaps(out, input)) {
+        (op != GURABO_SUM && columns == 0) || overlaps(out, input)) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
     gb_kernel kernel = {.kind = GB_KERNEL_ROWWISE, .args.rowwise = {
@@ -218,7 +228,8 @@ gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
         !shape_equal(&out->desc, &input->desc)) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
-    if (out->desc.dtype != input->desc.dtype || !out->contiguous || !input->contiguous ||
+    if (!gb_floating_dtype(input->desc.dtype) || out->desc.dtype != input->desc.dtype ||
+        !out->contiguous || !input->contiguous ||
         (scale && (!scale->contiguous ||
                    (scale->desc.dtype != GURABO_F32 && scale->desc.dtype != input->desc.dtype)))) {
         return gb_fail(GURABO_UNSUPPORTED, id);
@@ -241,4 +252,124 @@ gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
         .epsilon = epsilon
     }};
     return submit(stream, out, input, scale, &kernel);
+}
+
+gurabo_status gurabo_activation_async(gurabo_stream *stream, gurabo_activation op,
+                                      gurabo_tensor *out, const gurabo_tensor *input)
+{
+    if (!stream || !out || !input) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = stream->context;
+    gurabo_backend id = context->backend->id;
+    if (out->buffer->context != context || input->buffer->context != context) {
+        return gb_fail(GURABO_CONTEXT_MISMATCH, id);
+    }
+    if (op < GURABO_SILU || op > GURABO_GELU || !shape_equal(&out->desc, &input->desc) ||
+        (overlaps(out, input) && out->offset != input->offset)) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    if (!gb_floating_dtype(input->desc.dtype) || out->desc.dtype != input->desc.dtype ||
+        !out->contiguous || !input->contiguous) {
+        return gb_fail(GURABO_UNSUPPORTED, id);
+    }
+    const uint32_t kernels[] = {GB_POINTWISE_SILU, GB_POINTWISE_RELU, GB_POINTWISE_GELU};
+    gb_kernel kernel = {.kind = GB_KERNEL_POINTWISE, .args.pointwise.op = kernels[op - GURABO_SILU]};
+    return submit_pointwise(stream, out, input, NULL, &kernel);
+}
+
+static int make_softmax_mask(gb_rowwise *args, const gurabo_tensor_desc *input,
+                             const gurabo_tensor_desc *mask)
+{
+    if (mask->rank > input->rank) {
+        return 0;
+    }
+    uint32_t pad = input->rank - mask->rank;
+    for (uint32_t axis = pad; axis < input->rank; ++axis) {
+        uint64_t n = mask->extent[axis - pad];
+        if (n != 1 && n != input->extent[axis]) {
+            return 0;
+        }
+        args->mask_stride[axis] = n == 1 ? 0 : mask->stride[axis - pad];
+    }
+    return 1;
+}
+
+gurabo_status gurabo_softmax_async(gurabo_stream *stream, gurabo_tensor *out,
+                                   const gurabo_tensor *input, uint32_t axis,
+                                   const gurabo_tensor *keep_mask)
+{
+    if (!stream || !out || !input) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = stream->context;
+    gurabo_backend id = context->backend->id;
+    if (out->buffer->context != context || input->buffer->context != context ||
+        (keep_mask && keep_mask->buffer->context != context)) {
+        return gb_fail(GURABO_CONTEXT_MISMATCH, id);
+    }
+    if (axis >= input->desc.rank || !shape_equal(&out->desc, &input->desc) ||
+        (overlaps(out, input) && out->offset != input->offset) ||
+        (keep_mask && overlaps(out, keep_mask))) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    if (axis + 1 != input->desc.rank || !gb_floating_dtype(input->desc.dtype) ||
+        out->desc.dtype != input->desc.dtype || !out->contiguous || !input->contiguous ||
+        (keep_mask && (keep_mask->desc.dtype != GURABO_U8 || !keep_mask->contiguous))) {
+        return gb_fail(GURABO_UNSUPPORTED, id);
+    }
+    uint64_t columns = input->desc.extent[axis];
+    gb_kernel kernel = {.kind = GB_KERNEL_ROWWISE, .args.rowwise = {
+        .out = gb_buffer_address(out->buffer, out->offset),
+        .input = gb_buffer_address(input->buffer, input->offset),
+        .mask = keep_mask ? gb_buffer_address(keep_mask->buffer, keep_mask->offset) : NULL,
+        .rank = input->desc.rank,
+        .rows = columns ? element_count(out) / columns : 0,
+        .columns = columns,
+        .op = GB_ROW_SOFTMAX,
+        .input_dtype = input->desc.dtype
+    }};
+    memcpy(kernel.args.rowwise.extent, input->desc.extent, sizeof(input->desc.extent));
+    if (keep_mask && !make_softmax_mask(&kernel.args.rowwise, &input->desc, &keep_mask->desc)) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    return submit(stream, out, input, keep_mask, &kernel);
+}
+
+gurabo_status gurabo_embedding_async(gurabo_stream *stream, gurabo_tensor *out,
+                                     const gurabo_tensor *table, const gurabo_tensor *indices)
+{
+    if (!stream || !out || !table || !indices) {
+        return gb_fail(GURABO_INVALID_HANDLE, 0);
+    }
+    gurabo_context *context = stream->context;
+    gurabo_backend id = context->backend->id;
+    if (out->buffer->context != context || table->buffer->context != context ||
+        indices->buffer->context != context) {
+        return gb_fail(GURABO_CONTEXT_MISMATCH, id);
+    }
+    uint32_t rank = indices->desc.rank;
+    uint64_t vocabulary = table->desc.extent[0], width = table->desc.extent[1];
+    if (table->desc.rank != 2 || !vocabulary || !width || out->desc.rank != rank + 1 ||
+        out->desc.extent[rank] != width ||
+        memcmp(out->desc.extent, indices->desc.extent, rank * sizeof(out->desc.extent[0])) != 0 ||
+        overlaps(out, table) || overlaps(out, indices)) {
+        return gb_fail(GURABO_INVALID_ARGUMENT, id);
+    }
+    if (!gb_floating_dtype(table->desc.dtype) || out->desc.dtype != table->desc.dtype ||
+        (indices->desc.dtype != GURABO_I32 && indices->desc.dtype != GURABO_I64) ||
+        !out->contiguous || !table->contiguous || !indices->contiguous) {
+        return gb_fail(GURABO_UNSUPPORTED, id);
+    }
+    gb_kernel kernel = {.kind = GB_KERNEL_EMBEDDING, .args.embedding = {
+        .out = gb_buffer_address(out->buffer, out->offset),
+        .table = gb_buffer_address(table->buffer, table->offset),
+        .indices = gb_buffer_address(indices->buffer, indices->offset),
+        .index_count = element_count(indices),
+        .vocabulary = vocabulary,
+        .width = width,
+        .element_bytes = (uint32_t)gb_dtype_size(table->desc.dtype),
+        .index_bytes = (uint32_t)gb_dtype_size(indices->desc.dtype)
+    }};
+    return submit(stream, out, table, indices, &kernel);
 }

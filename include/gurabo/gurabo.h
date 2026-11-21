@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 #define GURABO_ABI_VERSION_MAJOR 1u
-#define GURABO_ABI_VERSION_MINOR 5u
+#define GURABO_ABI_VERSION_MINOR 6u
 #define GURABO_ABI_VERSION ((GURABO_ABI_VERSION_MAJOR << 16) | GURABO_ABI_VERSION_MINOR)
 
 uint32_t gurabo_abi_version(void);

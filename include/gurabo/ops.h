@@ -35,7 +35,7 @@ gurabo_status gurabo_tensor_cast_async(gurabo_stream *stream, gurabo_tensor *out
                                        const gurabo_tensor *input);
 
 typedef uint32_t gurabo_binary_op;
-enum { GURABO_ADD = 1, GURABO_MUL = 2 };
+enum { GURABO_ADD = 1, GURABO_MUL = 2, GURABO_SUB = 3, GURABO_DIV = 4 };
 
 /* Contiguous F32, F16 or BF16 Tensors with matching dtypes. Inputs broadcast
    from the trailing axes. Arithmetic is F32, then rounded to the output
@@ -45,11 +45,12 @@ gurabo_status gurabo_binary_async(gurabo_stream *stream, gurabo_binary_op op,
                                   const gurabo_tensor *b);
 
 typedef uint32_t gurabo_reduction;
-enum { GURABO_SUM = 1, GURABO_MEAN = 2 };
+enum { GURABO_SUM = 1, GURABO_MEAN = 2, GURABO_MAX = 3 };
 
-/* Sum or mean over the last axis of a contiguous Tensor, with F32
+/* Sum, mean or maximum over the last axis of a contiguous Tensor, with F32
    accumulation and output. axis_mask has one bit per axis, starting at bit 0.
-   keep_dims leaves a size-one final axis. A sum over an empty axis is zero. */
+   keep_dims leaves a size-one final axis. An empty axis sums to zero and
+   returns INVALID_ARGUMENT for mean or max. Max propagates NaN. */
 gurabo_status gurabo_reduce_async(gurabo_stream *stream, gurabo_reduction op,
                                   gurabo_tensor *out, const gurabo_tensor *input,
                                   uint32_t axis_mask, uint32_t keep_dims);
@@ -61,6 +62,30 @@ gurabo_status gurabo_reduce_async(gurabo_stream *stream, gurabo_reduction op,
 gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
                                     const gurabo_tensor *input, const gurabo_tensor *scale,
                                     float epsilon);
+
+typedef uint32_t gurabo_activation;
+enum { GURABO_SILU = 1, GURABO_RELU = 2, GURABO_GELU = 3 };
+
+/* F32 arithmetic on matching contiguous floating-point Tensors. GELU uses
+   the erf definition. Exact in-place input/output is allowed. */
+gurabo_status gurabo_activation_async(gurabo_stream *stream, gurabo_activation op,
+                                      gurabo_tensor *out, const gurabo_tensor *input);
+
+/* Stable F32 softmax over the last axis. The optional contiguous U8 mask
+   broadcasts from the trailing axes. Masked elements and rows with only
+   masked or negative-infinity entries produce zero. Positive infinities
+   share probability equally. An unmasked NaN propagates to unmasked
+   entries. Output matches the input shape and dtype. Exact in-place is OK. */
+gurabo_status gurabo_softmax_async(gurabo_stream *stream, gurabo_tensor *out,
+                                   const gurabo_tensor *input, uint32_t axis,
+                                   const gurabo_tensor *keep_mask);
+
+/* Gather rows from a contiguous [vocabulary, width] floating-point table
+   using contiguous signed I32 or I64 indices. Output shape is the index
+   shape followed by width. Invalid indices write zero rows and report
+   OUT_OF_RANGE as a Stream execution error. */
+gurabo_status gurabo_embedding_async(gurabo_stream *stream, gurabo_tensor *out,
+                                     const gurabo_tensor *table, const gurabo_tensor *indices);
 
 #ifdef __cplusplus
 }

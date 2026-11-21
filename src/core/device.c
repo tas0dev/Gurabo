@@ -110,7 +110,10 @@ gurabo_status gurabo_device_get_caps(gurabo_backend id, uint32_t ordinal,
     caps.max_tensor_rank = GURABO_MAX_RANK;
     caps.storage_dtype_mask = (UINT64_C(1) << GURABO_F32) |
                               (UINT64_C(1) << GURABO_F16) |
-                              (UINT64_C(1) << GURABO_BF16);
+                              (UINT64_C(1) << GURABO_BF16) |
+                              (UINT64_C(1) << GURABO_U8) |
+                              (UINT64_C(1) << GURABO_I32) |
+                              (UINT64_C(1) << GURABO_I64);
     caps.feature_mask = backend->features;
     caps.min_buffer_alignment = backend->alignment;
     gb_write_struct(out, &caps, out->struct_size, sizeof(caps));

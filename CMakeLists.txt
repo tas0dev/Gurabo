@@ -11,6 +11,7 @@ option(GURABO_ENABLE_HIP "Enable the AMD HIP backend (requires HIP SDK and rocBL
 option(GURABO_ENABLE_CUDA "Enable the CUDA backend (reserved)" OFF)
 option(GURABO_BUILD_TESTS "Show and build the Gurabo test targets" OFF)
 option(GURABO_BUILD_BENCHMARKS "Show and build the Gurabo benchmark target" OFF)
+option(GURABO_BUILD_EXAMPLES "Build the Gurabo inference example" OFF)
 
 if(GURABO_ENABLE_CUDA)
     message(FATAL_ERROR "Gurabo's CUDA backend is not implemented")
@@ -121,11 +122,36 @@ if(GURABO_ENABLE_HIP)
     target_link_libraries(Gurabo PRIVATE hip::host roc::rocblas hiprtc::hiprtc)
 endif()
 
-# Optional CTest and benchmark targets.
+# Optional inference example and verification targets.
+if(GURABO_BUILD_EXAMPLES OR GURABO_BUILD_TESTS)
+    add_executable(gurabo_inference examples/inference.c)
+    target_link_libraries(gurabo_inference PRIVATE Gurabo::Gurabo)
+    if(NOT MSVC)
+        target_link_libraries(gurabo_inference PRIVATE m)
+    endif()
+endif()
+
 if(GURABO_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+set(gurabo_cmake_install_dir "${CMAKE_INSTALL_LIBDIR}/cmake/Gurabo")
+configure_package_config_file(
+    cmake/GuraboConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/GuraboConfig.cmake"
+    INSTALL_DESTINATION "${gurabo_cmake_install_dir}"
+)
+install(TARGETS Gurabo EXPORT GuraboTargets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    FILE_SET HEADERS DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+)
+install(EXPORT GuraboTargets NAMESPACE Gurabo:: DESTINATION "${gurabo_cmake_install_dir}")
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/GuraboConfig.cmake"
+    DESTINATION "${gurabo_cmake_install_dir}"
+)
 
 if(GURABO_BUILD_BENCHMARKS)
     add_executable(gurabo_benchmark benchmarks/matmul.c)

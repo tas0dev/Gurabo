@@ -27,6 +27,7 @@ typedef struct gb_job {
     uint64_t id;
     int marker_recorded;
     int uses_kernel_module;
+    void *kernel_completion;
     gurabo_event *recorded_event;
     gurabo_event *dependency;
     uint32_t count;
@@ -107,6 +108,24 @@ void gb_job_end(gurabo_stream *, gb_job *, gurabo_buffer *const *, uint32_t, gb_
 gb_result gb_buffer_unref(gurabo_buffer *);
 void gb_buffer_unref_deferred(gurabo_buffer *);
 void gb_buffer_collect(gurabo_context *);
+
+static inline int gb_floating_dtype(gurabo_dtype dtype)
+{
+    return dtype >= GURABO_F32 && dtype <= GURABO_BF16;
+}
+
+static inline size_t gb_dtype_size(gurabo_dtype dtype)
+{
+    switch (dtype) {
+    case GURABO_F32: return sizeof(float);
+    case GURABO_F16:
+    case GURABO_BF16: return sizeof(uint16_t);
+    case GURABO_U8: return sizeof(uint8_t);
+    case GURABO_I32: return sizeof(int32_t);
+    case GURABO_I64: return sizeof(int64_t);
+    default: return 0;
+    }
+}
 
 static inline void *gb_buffer_address(const gurabo_buffer *buffer, uint64_t offset)
 {

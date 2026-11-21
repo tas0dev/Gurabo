@@ -71,7 +71,8 @@ typedef struct {
     gb_result (*matmul)(void *stream, const gb_matmul *);
     gb_result (*kernel_prepare)(uint32_t ordinal, void **state);
     gb_result (*kernel_release)(uint32_t ordinal, void *state);
-    gb_result (*kernel_launch)(void *stream, void *state, const gb_kernel *);
+    gb_result (*kernel_launch)(void *stream, void *state, const gb_kernel *, void **completion);
+    gb_result (*kernel_complete)(void *state, void *completion);
 } gb_backend;
 
 static inline gb_result gb_status(gurabo_status status)

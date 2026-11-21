@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+if(NOT WIN32)
+    find_dependency(Threads)
+endif()
+if(@GURABO_ENABLE_HIP@)
+    find_dependency(hip CONFIG)
+    find_dependency(rocblas CONFIG)
+    find_dependency(hiprtc CONFIG)
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/GuraboTargets.cmake")
+check_required_components(Gurabo)

@@ -67,7 +67,10 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     OK(gurabo_device_get_caps(backend, ordinal, &caps));
     CHECK(caps.storage_dtype_mask == ((UINT64_C(1) << GURABO_F32) |
                                       (UINT64_C(1) << GURABO_F16) |
-                                      (UINT64_C(1) << GURABO_BF16)));
+                                      (UINT64_C(1) << GURABO_BF16) |
+                                      (UINT64_C(1) << GURABO_U8) |
+                                      (UINT64_C(1) << GURABO_I32) |
+                                      (UINT64_C(1) << GURABO_I64)));
     CHECK(caps.feature_mask & GURABO_FEATURE_F32_MATMUL);
     CHECK(caps.feature_mask & GURABO_FEATURE_F16_GEMM);
     CHECK(caps.feature_mask & GURABO_FEATURE_BF16_GEMM);
@@ -75,6 +78,10 @@ static void check_discovery(gurabo_backend backend, uint32_t ordinal)
     CHECK(caps.feature_mask & GURABO_FEATURE_BINARY_ADD_MUL);
     CHECK(caps.feature_mask & GURABO_FEATURE_ROW_REDUCTION);
     CHECK(caps.feature_mask & GURABO_FEATURE_RMS_NORM);
+    CHECK(caps.feature_mask & GURABO_FEATURE_ACTIVATION);
+    CHECK(caps.feature_mask & GURABO_FEATURE_SOFTMAX);
+    CHECK(caps.feature_mask & GURABO_FEATURE_EMBEDDING);
+    CHECK(caps.feature_mask & GURABO_FEATURE_BINARY_SUB_DIV);
     CHECK(!!(caps.feature_mask & GURABO_FEATURE_PINNED_HOST_MEMORY) == (backend == GURABO_HIP));
     CHECK(caps.max_tensor_rank == GURABO_MAX_RANK && caps.min_buffer_alignment >= sizeof(float));
 
@@ -409,6 +416,11 @@ static void check_binary_broadcast(gurabo_context *context, gurabo_stream *strea
     OK(gurabo_binary_async(stream, GURABO_ADD, out, out, scalar));
     OK(gurabo_buffer_read(stream, actual, buffer, 64, sizeof(actual)));
     CHECK(memcmp(actual, expected, sizeof(expected)) == 0);
+    const float divided[] = {2, 2, 2, 4, 4, 4};
+    OK(gurabo_binary_async(stream, GURABO_SUB, out, out, scalar));
+    OK(gurabo_binary_async(stream, GURABO_DIV, out, out, rhs));
+    OK(gurabo_buffer_read(stream, actual, buffer, 64, sizeof(actual)));
+    CHECK(memcmp(actual, divided, sizeof(divided)) == 0);
     OK(gurabo_tensor_release(&strided));
     OK(gurabo_tensor_release(&partial_alias));
     OK(gurabo_tensor_release(&broadcast_alias));
@@ -631,6 +643,124 @@ static void check_float16_conversion(void)
     }
 }
 
+static void check_softmax_activation(gurabo_context *context, gurabo_stream *stream)
+{
+    const float logits[] = {1000, 1001, 1002, 1, 2, 3, INFINITY, 1, INFINITY, NAN, 2, 3};
+    const uint8_t mask[] = {1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1};
+    const float activations[] = {-INFINITY, -2, -0.0f, 2, INFINITY, NAN};
+    float values[12];
+    gurabo_buffer *buffer = NULL;
+    gurabo_tensor *x = NULL, *keep = NULL, *activation = NULL, *maxima = NULL, *mask_row = NULL;
+    gurabo_tensor_desc shape = matrix_desc(4, 3), vector = matrix_desc(6, 1);
+    vector.rank = 1;
+    size_t mask_offset = sizeof(logits);
+    size_t activation_offset = mask_offset + sizeof(mask);
+    size_t maxima_offset = activation_offset + sizeof(activations);
+    OK(gurabo_buffer_alloc(context, maxima_offset + 4 * sizeof(float), 0, &buffer));
+    OK(gurabo_tensor_create(buffer, 0, &shape, &x));
+    OK(gurabo_tensor_create(buffer, activation_offset, &vector, &activation));
+    vector.extent[0] = 4;
+    OK(gurabo_tensor_create(buffer, maxima_offset, &vector, &maxima));
+    shape.dtype = GURABO_U8;
+    OK(gurabo_tensor_create(buffer, mask_offset, &shape, &keep));
+    vector.dtype = GURABO_U8;
+    vector.extent[0] = 3;
+    OK(gurabo_tensor_create(buffer, mask_offset, &vector, &mask_row));
+    OK(gurabo_buffer_write(stream, buffer, 0, logits, sizeof(logits)));
+    OK(gurabo_buffer_write(stream, buffer, mask_offset, mask, sizeof(mask)));
+    OK(gurabo_reduce_async(stream, GURABO_MAX, maxima, x, 2u, 0));
+    OK(gurabo_buffer_read(stream, values, buffer, maxima_offset, 4 * sizeof(float)));
+    CHECK(values[0] == 1002 && values[1] == 3 && isinf(values[2]) && isnan(values[3]));
+    STATUS(gurabo_softmax_async(stream, x, x, 0, keep), GURABO_UNSUPPORTED);
+    OK(gurabo_softmax_async(stream, x, x, 1, keep));
+    OK(gurabo_buffer_read(stream, values, buffer, 0, sizeof(values)));
+    CHECK(fabsf(values[0] - 0.11920292f) < 1e-6f && values[1] == 0);
+    CHECK(fabsf(values[2] - 0.88079708f) < 1e-6f);
+    CHECK(values[3] == 0 && values[4] == 0 && values[5] == 0);
+    CHECK(values[6] == 0.5f && values[7] == 0 && values[8] == 0.5f);
+    CHECK(values[9] == 0 && fabsf(values[10] - 0.26894142f) < 1e-6f);
+    CHECK(fabsf(values[11] - 0.73105858f) < 1e-6f);
+
+    OK(gurabo_buffer_write(stream, buffer, 0, logits, sizeof(logits)));
+    OK(gurabo_softmax_async(stream, x, x, 1, mask_row));
+    OK(gurabo_buffer_read(stream, values, buffer, 0, sizeof(values)));
+    CHECK(fabsf(values[3] - values[0]) < 1e-6f && values[4] == 0);
+    CHECK(fabsf(values[5] - values[2]) < 1e-6f);
+
+    OK(gurabo_buffer_write(stream, buffer, 0, logits, sizeof(logits)));
+    OK(gurabo_softmax_async(stream, x, x, 1, NULL));
+    OK(gurabo_buffer_read(stream, values, buffer, 0, sizeof(values)));
+    CHECK(fabsf(values[0] + values[1] + values[2] - 1.0f) < 1e-6f);
+    CHECK(isnan(values[9]) && isnan(values[10]) && isnan(values[11]));
+    for (gurabo_activation op = GURABO_SILU; op <= GURABO_GELU; ++op) {
+        OK(gurabo_buffer_write(stream, buffer, activation_offset, activations, sizeof(activations)));
+        OK(gurabo_activation_async(stream, op, activation, activation));
+        OK(gurabo_buffer_read(stream, values, buffer, activation_offset, sizeof(activations)));
+        CHECK(values[0] == 0 && values[2] == 0 && isinf(values[4]) && isnan(values[5]));
+        if (op == GURABO_SILU) {
+            CHECK(fabsf(values[1] + 0.23840584f) < 1e-6f);
+            CHECK(fabsf(values[3] - 1.76159416f) < 1e-6f);
+        } else if (op == GURABO_RELU) {
+            CHECK(values[1] == 0 && values[3] == 2);
+        } else {
+            CHECK(fabsf(values[1] + 0.04550026f) < 1e-6f);
+            CHECK(fabsf(values[3] - 1.95449974f) < 1e-6f);
+        }
+    }
+    OK(gurabo_tensor_release(&activation));
+    OK(gurabo_tensor_release(&maxima));
+    OK(gurabo_tensor_release(&mask_row));
+    OK(gurabo_tensor_release(&keep));
+    OK(gurabo_tensor_release(&x));
+    OK(gurabo_buffer_release(&buffer));
+}
+
+static void check_embedding_failure(gurabo_backend backend, uint32_t ordinal)
+{
+    const float table_values[] = {1, 2, 3, 4};
+    const int64_t valid[] = {1, 0, 1}, invalid[] = {-1, 0, INT64_MAX};
+    const float expected_valid[] = {3, 4, 1, 2, 3, 4};
+    const float expected_invalid[] = {0, 0, 1, 2, 0, 0};
+    const size_t index_offset = sizeof(table_values);
+    const size_t output_offset = index_offset + sizeof(valid);
+    float actual[6];
+    gurabo_context *context = NULL;
+    gurabo_stream *stream = NULL, *readback = NULL;
+    gurabo_buffer *buffer = NULL;
+    gurabo_tensor *table = NULL, *indices = NULL, *out = NULL;
+    gurabo_tensor_desc table_shape = matrix_desc(2, 2), index_shape = matrix_desc(3, 1);
+    gurabo_tensor_desc out_shape = matrix_desc(3, 2);
+    index_shape.rank = 1;
+    index_shape.dtype = GURABO_I64;
+    OK(gurabo_context_create(backend, ordinal, &context));
+    OK(gurabo_stream_create(context, &stream));
+    OK(gurabo_stream_create(context, &readback));
+    OK(gurabo_buffer_alloc(context, output_offset + sizeof(actual), 0, &buffer));
+    OK(gurabo_tensor_create(buffer, 0, &table_shape, &table));
+    OK(gurabo_tensor_create(buffer, index_offset, &index_shape, &indices));
+    OK(gurabo_tensor_create(buffer, output_offset, &out_shape, &out));
+    OK(gurabo_buffer_write(stream, buffer, 0, table_values, sizeof(table_values)));
+    OK(gurabo_buffer_write(stream, buffer, index_offset, valid, sizeof(valid)));
+    OK(gurabo_embedding_async(stream, out, table, indices));
+    OK(gurabo_buffer_read(stream, actual, buffer, output_offset, sizeof(actual)));
+    CHECK(memcmp(actual, expected_valid, sizeof(actual)) == 0);
+    OK(gurabo_buffer_write(stream, buffer, index_offset, invalid, sizeof(invalid)));
+    OK(gurabo_embedding_async(stream, out, table, indices));
+    STATUS(gurabo_stream_synchronize(stream), GURABO_OUT_OF_RANGE);
+    gurabo_error_info error = {.struct_size = GURABO_ERROR_INFO_SIZE};
+    OK(gurabo_stream_get_error(stream, &error));
+    CHECK(error.phase == GURABO_ERROR_EXECUTION && error.submission_id != 0);
+    OK(gurabo_buffer_read(readback, actual, buffer, output_offset, sizeof(actual)));
+    CHECK(memcmp(actual, expected_invalid, sizeof(actual)) == 0);
+    OK(gurabo_tensor_release(&out));
+    OK(gurabo_tensor_release(&indices));
+    OK(gurabo_tensor_release(&table));
+    OK(gurabo_buffer_release(&buffer));
+    OK(gurabo_stream_destroy(&readback));
+    STATUS(gurabo_stream_destroy(&stream), GURABO_OUT_OF_RANGE);
+    STATUS(gurabo_context_destroy(&context), GURABO_OUT_OF_RANGE);
+}
+
 static double check_matmul(gurabo_context *context, gurabo_stream *stream,
                            gurabo_dtype dtype, uint32_t trans_a, uint32_t trans_b,
                            float beta, float actual[8])
@@ -778,6 +908,7 @@ int main(int argc, char **argv)
     check_rowwise(context, stream, GURABO_BF16, 33);
     check_empty_reduction(context, stream);
     check_rms_chain(context, stream);
+    check_softmax_activation(context, stream);
     check_float16_conversion();
     for (gurabo_dtype dtype = GURABO_F32; dtype <= GURABO_BF16; ++dtype) {
         double max_input_rounding = 0;
@@ -815,5 +946,6 @@ int main(int argc, char **argv)
     OK(gurabo_stream_destroy(&cpu_stream));
     OK(gurabo_context_destroy(&cpu_context));
     CHECK(!context && !stream);
+    check_embedding_failure(backend, ordinal);
     return 0;
 }

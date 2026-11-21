@@ -69,12 +69,11 @@ gurabo_status gurabo_tensor_create(gurabo_buffer *buffer, uint64_t byte_offset,
         desc->dtype < GURABO_F32 || desc->dtype > GURABO_I64) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
-    if (desc->dtype > GURABO_BF16 || buffer->kind != GB_BUFFER_DEVICE) {
+    size_t element_size = gb_dtype_size(desc->dtype);
+    if (!element_size || buffer->kind != GB_BUFFER_DEVICE) {
         return gb_fail(GURABO_UNSUPPORTED, id);
     }
-    size_t element_size = desc->dtype == GURABO_F32 ? sizeof(float) : sizeof(uint16_t);
-    size_t alignment = desc->dtype == GURABO_F32 ? _Alignof(float) : _Alignof(uint16_t);
-    if (byte_offset % alignment) {
+    if (byte_offset % element_size) {
         return gb_fail(GURABO_INVALID_ARGUMENT, id);
     }
     gurabo_tensor tensor = {0};
@@ -176,7 +175,8 @@ static gurabo_status submit_gemm(gurabo_stream *stream, gurabo_tensor *out,
         out->desc.rank != 2) {
         return gb_fail(GURABO_INVALID_ARGUMENT, backend->id);
     }
-    if (out->desc.dtype != GURABO_F32 || a->desc.dtype != b->desc.dtype ||
+    if (out->desc.dtype != GURABO_F32 || !gb_floating_dtype(a->desc.dtype) ||
+        a->desc.dtype != b->desc.dtype ||
         (!allow_mixed && a->desc.dtype != GURABO_F32)) {
         return gb_fail(GURABO_UNSUPPORTED, backend->id);
     }

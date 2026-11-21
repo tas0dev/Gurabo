@@ -44,6 +44,24 @@ gurabo_status gurabo_binary_async(gurabo_stream *stream, gurabo_binary_op op,
                                   gurabo_tensor *out, const gurabo_tensor *a,
                                   const gurabo_tensor *b);
 
+typedef uint32_t gurabo_reduction;
+enum { GURABO_SUM = 1, GURABO_MEAN = 2 };
+
+/* Sum or mean over the last axis of a contiguous Tensor, with F32
+   accumulation and output. axis_mask has one bit per axis, starting at bit 0.
+   keep_dims leaves a size-one final axis. A sum over an empty axis is zero. */
+gurabo_status gurabo_reduce_async(gurabo_stream *stream, gurabo_reduction op,
+                                  gurabo_tensor *out, const gurabo_tensor *input,
+                                  uint32_t axis_mask, uint32_t keep_dims);
+
+/* Normalize each contiguous row using its F32 mean square and a positive,
+   finite epsilon. Output has the input shape and dtype. Optional scale must
+   be a contiguous vector over the last axis, in F32 or the input dtype.
+   Exact in-place input/output is allowed. */
+gurabo_status gurabo_rms_norm_async(gurabo_stream *stream, gurabo_tensor *out,
+                                    const gurabo_tensor *input, const gurabo_tensor *scale,
+                                    float epsilon);
+
 #ifdef __cplusplus
 }
 #endif

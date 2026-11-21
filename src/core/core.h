@@ -26,7 +26,7 @@ typedef struct gb_job {
     void *marker;
     uint64_t id;
     int marker_recorded;
-    int uses_pointwise_module;
+    int uses_kernel_module;
     gurabo_event *recorded_event;
     gurabo_event *dependency;
     uint32_t count;
@@ -42,10 +42,10 @@ struct gurabo_context {
     uint64_t children;
     uint64_t allocated_bytes;
     uint64_t last_submission;
-    void *pointwise_state;
+    void *kernel_state;
     gurabo_error_info error;
     int lost;
-    int pointwise_in_doubt;
+    int kernel_in_doubt;
 };
 
 struct gurabo_stream {

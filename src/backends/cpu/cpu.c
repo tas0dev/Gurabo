@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include "backend.h"
@@ -127,12 +128,39 @@ static gb_result cpu_matmul(void *stream, const gb_matmul *args)
     return gb_status(GURABO_OK);
 }
 
-static gb_result cpu_pointwise(void *stream, void *state, const gb_pointwise *args)
+static void cpu_rowwise(const gb_rowwise *args)
+{
+    int rms = args->op == GB_ROW_RMS_NORM;
+    for (uint64_t row = 0; row < args->rows; ++row) {
+        uint64_t start = row * args->columns;
+        float sum = 0.0f;
+        for (uint64_t col = 0; col < args->columns; ++col) {
+            float value = gb_load_float(args->input, start + col, args->input_dtype);
+            sum += rms ? value * value : value;
+        }
+        if (rms) {
+            float denominator = sqrtf(sum / (float)args->columns + args->epsilon);
+            for (uint64_t col = 0; col < args->columns; ++col) {
+                gb_rms_write(args, start, col, denominator);
+            }
+        } else {
+            float value = args->op == GB_ROW_MEAN ? sum / (float)args->columns : sum;
+            gb_store_float(args->out, row, GB_POINTWISE_F32, value);
+        }
+    }
+}
+
+static gb_result cpu_kernel_launch(void *stream, void *state, const gb_kernel *kernel)
 {
     (void)stream;
     (void)state;
-    for (uint64_t i = 0; i < args->count; ++i) {
-        gb_pointwise_apply(args, i);
+    if (kernel->kind == GB_KERNEL_ROWWISE) {
+        cpu_rowwise(&kernel->args.rowwise);
+    } else {
+        const gb_pointwise *args = &kernel->args.pointwise;
+        for (uint64_t i = 0; i < args->count; ++i) {
+            gb_pointwise_apply(args, i);
+        }
     }
     return gb_status(GURABO_OK);
 }
@@ -141,7 +169,8 @@ const gb_backend gb_cpu = {
     .id = GURABO_CPU,
     .alignment = 64,
     .features = GURABO_FEATURE_F32_MATMUL | GURABO_FEATURE_F16_GEMM | GURABO_FEATURE_BF16_GEMM |
-                GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL,
+                GURABO_FEATURE_TENSOR_CAST | GURABO_FEATURE_BINARY_ADD_MUL |
+                GURABO_FEATURE_ROW_REDUCTION | GURABO_FEATURE_RMS_NORM,
     .device_count = cpu_count,
     .device_info = cpu_info,
     .alloc = cpu_alloc,
@@ -152,5 +181,5 @@ const gb_backend gb_cpu = {
     .transfer = cpu_transfer,
     .copy = cpu_copy,
     .matmul = cpu_matmul,
-    .pointwise = cpu_pointwise
+    .kernel_launch = cpu_kernel_launch
 };
